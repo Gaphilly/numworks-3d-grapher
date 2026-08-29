@@ -1,5 +1,6 @@
 use crate::camera::{Camera, ScreenPoint};
 use crate::eadk::{self, Color, Rect};
+use crate::function::SurfaceFunction;
 use crate::surface::{self, COLUMNS, ROWS};
 
 const SCREEN_WIDTH: usize = 320;
@@ -8,14 +9,14 @@ const BAND_HEIGHT: usize = 8;
 const BACKGROUND: Color = Color { rgb565: 0xffff };
 const WIRE: Color = Color { rgb565: 0x001f };
 
-pub fn render(camera: &Camera) {
+pub fn render<F: SurfaceFunction>(camera: &Camera, function: &F) {
     let mut projected = [[ScreenPoint::INVALID; COLUMNS]; ROWS];
     let projector = camera.projector();
     let mut row = 0;
     while row < ROWS {
         let mut column = 0;
         while column < COLUMNS {
-            projected[row][column] = projector.project(surface::point(column, row));
+            projected[row][column] = projector.project(surface::point(column, row, function));
             column += 1;
         }
         row += 1;

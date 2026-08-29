@@ -3,6 +3,7 @@
 
 mod camera;
 pub mod eadk;
+mod function;
 mod input;
 mod math;
 mod rendering;
@@ -23,13 +24,14 @@ pub static EADK_APP_ICON: [u8; 4250] = *include_bytes!("../target/icon.nwi");
 #[no_mangle]
 pub extern "C" fn main() {
     let mut camera = camera::Camera::new();
-    rendering::render(&camera);
+    let function = function::SinCosSurface;
+    rendering::render(&camera, &function);
 
     loop {
         let state = eadk::keyboard::scan();
         match input::update(&mut camera, state) {
             input::Action::Exit => return,
-            input::Action::Redraw => rendering::render(&camera),
+            input::Action::Redraw => rendering::render(&camera, &function),
             input::Action::None => eadk::timing::msleep(20),
         }
     }

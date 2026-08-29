@@ -13,6 +13,13 @@ pub struct Rect {
     pub height: u16,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Point {
+    pub x: u16,
+    pub y: u16,
+}
+
 pub mod backlight {
     pub fn set_brightness(brightness: u8) {
         unsafe {
@@ -33,6 +40,7 @@ pub mod backlight {
 
 pub mod display {
     use super::Color;
+    use super::Point;
     use super::Rect;
 
     pub fn push_rect(rect: Rect, pixels: &[Color]) {
@@ -57,10 +65,38 @@ pub mod display {
         }
     }
 
+    pub fn draw_string(
+        text: &[u8],
+        point: Point,
+        large_font: bool,
+        text_color: Color,
+        background_color: Color,
+    ) {
+        if text.last().copied() != Some(0) {
+            return;
+        }
+        unsafe {
+            eadk_display_draw_string(
+                text.as_ptr(),
+                point,
+                large_font,
+                text_color,
+                background_color,
+            );
+        }
+    }
+
     extern "C" {
         fn eadk_display_push_rect_uniform(rect: Rect, color: Color);
         fn eadk_display_push_rect(rect: Rect, color: *const Color);
         fn eadk_display_wait_for_vblank();
+        fn eadk_display_draw_string(
+            text: *const u8,
+            point: Point,
+            large_font: bool,
+            text_color: Color,
+            background_color: Color,
+        );
     }
 }
 
@@ -71,6 +107,7 @@ pub mod keyboard {
     pub const UP: u8 = 1;
     pub const DOWN: u8 = 2;
     pub const RIGHT: u8 = 3;
+    pub const OK: u8 = 4;
     pub const BACK: u8 = 5;
     pub const PLUS: u8 = 45;
     pub const MINUS: u8 = 46;

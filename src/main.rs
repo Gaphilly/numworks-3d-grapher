@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
+mod app;
 mod camera;
 pub mod eadk;
 mod expression;
@@ -9,6 +10,7 @@ mod input;
 mod math;
 mod rendering;
 mod surface;
+mod ui;
 
 #[cfg(not(test))]
 #[used]
@@ -28,19 +30,34 @@ pub static EADK_APP_ICON: [u8; 4250] = *include_bytes!("../target/icon.nwi");
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn main() {
-    let mut camera = camera::Camera::new();
     let function = match expression::CompiledExpression::compile("sin(x) * cos(y)") {
         Ok(expression) => expression,
         Err(_) => loop {},
     };
-    rendering::render(&camera, &function);
+    let mut app = app::AppState::new();
 
     loop {
-        let state = eadk::keyboard::scan();
-        match input::update(&mut camera, state) {
-            input::Action::Exit => return,
-            input::Action::Redraw => rendering::render(&camera, &function),
-            input::Action::None => eadk::timing::msleep(20),
+        if app.dirty.content {
+            match app.active_tab {
+                app::Tab::Graph => rendering::render(&app.camera, &function),
+                app::Tab::Equation => ui::draw_equation_placeholder(),
+                app::Tab::Settings => ui::draw_settings_placeholder(),
+            }
+            app.dirty.content = false;
         }
+        if app.dirty.header {
+            ui::draw_header(
+                app.active_tab.index(),
+                app.selected_tab.index(),
+                app.focus == app::Focus::Tabs,
+            );
+            app.dirty.header = false;
+        }
+
+        let keys = eadk::keyboard::scan();
+        if let app::UpdateResult::Exit = app.update(keys) {
+            return;
+        }
+        eadk::timing::msleep(20);
     }
 }

@@ -6,6 +6,7 @@ use crate::surface::{self, COLUMNS, ROWS};
 const SCREEN_WIDTH: usize = 320;
 const SCREEN_HEIGHT: usize = 240;
 const BAND_HEIGHT: usize = 8;
+const GRAPH_TOP: usize = 24;
 const BACKGROUND: Color = Color { rgb565: 0xffff };
 const WIRE: Color = Color { rgb565: 0x001f };
 
@@ -24,7 +25,7 @@ pub fn render<F: SurfaceFunction>(camera: &Camera, function: &F) {
 
     eadk::display::wait_for_vblank();
     let mut pixels = [BACKGROUND; SCREEN_WIDTH * BAND_HEIGHT];
-    let mut band_y = 0;
+    let mut band_y = GRAPH_TOP;
     while band_y < SCREEN_HEIGHT {
         pixels.fill(BACKGROUND);
 

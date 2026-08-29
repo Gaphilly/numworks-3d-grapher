@@ -122,8 +122,10 @@ extern "C" {
     fn eadk_random() -> u32;
 }
 
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_panic: &PanicInfo<'_>) -> ! {
     loop {} // FIXME: Do something better. Exit the app maybe?

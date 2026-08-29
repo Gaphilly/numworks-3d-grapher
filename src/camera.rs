@@ -56,6 +56,9 @@ pub struct Projector {
 
 impl Projector {
     pub fn project(&self, point: Point3) -> ScreenPoint {
+        if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+            return ScreenPoint::INVALID;
+        }
         let rotated_x = self.cos_yaw * point.x - self.sin_yaw * point.y;
         let yawed_y = self.sin_yaw * point.x + self.cos_yaw * point.y;
         let rotated_y = self.cos_pitch * yawed_y - self.sin_pitch * point.z;

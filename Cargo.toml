@@ -1,5 +1,5 @@
 [package]
-name = "epsilon-sample-app"
+name = "numworks-3d-grapher"
 version = "0.1.0"
-authors = ["NumWorks <contact@numworks.com>"]
+authors = ["Gabriel Bourneau"]
 edition = "2018"

@@ -1,14 +1,16 @@
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Color {
-    pub rgb565: u16
+    pub rgb565: u16,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Rect {
     pub x: u16,
     pub y: u16,
     pub width: u16,
-    pub height: u16
+    pub height: u16,
 }
 
 pub mod backlight {
@@ -27,14 +29,17 @@ pub mod backlight {
         fn eadk_backlight_set_brightness(brightness: u8);
         fn eadk_backlight_brightness() -> u8;
     }
-
 }
 
 pub mod display {
-    use super::Rect;
     use super::Color;
+    use super::Rect;
 
     pub fn push_rect(rect: Rect, pixels: &[Color]) {
+        let required = rect.width as usize * rect.height as usize;
+        if pixels.len() < required {
+            return;
+        }
         unsafe {
             eadk_display_push_rect(rect, pixels.as_ptr());
         }
@@ -56,6 +61,30 @@ pub mod display {
         fn eadk_display_push_rect_uniform(rect: Rect, color: Color);
         fn eadk_display_push_rect(rect: Rect, color: *const Color);
         fn eadk_display_wait_for_vblank();
+    }
+}
+
+pub mod keyboard {
+    pub type State = u64;
+
+    pub const LEFT: u8 = 0;
+    pub const UP: u8 = 1;
+    pub const DOWN: u8 = 2;
+    pub const RIGHT: u8 = 3;
+    pub const BACK: u8 = 5;
+    pub const PLUS: u8 = 45;
+    pub const MINUS: u8 = 46;
+
+    pub fn scan() -> State {
+        unsafe { eadk_keyboard_scan() }
+    }
+
+    pub fn key_down(state: State, key: u8) -> bool {
+        key < 64 && ((state >> key) & 1) != 0
+    }
+
+    extern "C" {
+        fn eadk_keyboard_scan() -> State;
     }
 }
 
@@ -86,9 +115,7 @@ pub mod timing {
 }
 
 pub fn random() -> u32 {
-    unsafe {
-        return eadk_random()
-    }
+    unsafe { return eadk_random() }
 }
 
 extern "C" {

@@ -18,6 +18,7 @@ mod graph;
 mod input;
 mod math;
 mod rendering;
+mod settings;
 mod surface;
 mod ui;
 
@@ -37,7 +38,11 @@ pub static EADK_APP_API_LEVEL: u32 = 0;
 /// Build-script-generated NWI icon embedded for nwlink packaging.
 #[used]
 #[link_section = ".rodata.eadk_app_icon"]
-pub static EADK_APP_ICON: [u8; 4250] = *include_bytes!("../target/icon.nwi");
+// The NWI payload is LZ4-compressed, so its byte length legitimately changes
+// when the PNG artwork changes. Keep the array length derived from the actual
+// generated asset rather than coupling Rust source to one icon revision.
+pub static EADK_APP_ICON: [u8; include_bytes!("../target/icon.nwi").len()] =
+    *include_bytes!("../target/icon.nwi");
 
 #[cfg(not(test))]
 /// Firmware-invoked C entry point. It never depends on a Rust standard runtime.
@@ -61,12 +66,25 @@ pub extern "C" fn main() {
                         surface.resample(app.domain, &function);
                         app.dirty.surface = false;
                     }
-                    rendering::render(&app.camera, app.domain, &surface);
+                    #[cfg(debug_assertions)]
+                    let render_started_ms = eadk::timing::millis();
+                    rendering::render(&app.camera, app.domain, &surface, app.graph_options);
+                    #[cfg(debug_assertions)]
+                    app.record_graph_render_ms(
+                        eadk::timing::millis().saturating_sub(render_started_ms),
+                    );
+                    app.dirty.graph = false;
                 }
                 app::Tab::Equation => {
                     ui::draw_equation_editor(&app.editor, app.focus == app::Focus::Content)
                 }
-                app::Tab::Settings => ui::draw_settings_placeholder(),
+                app::Tab::Settings => ui::draw_settings(
+                    &app.settings,
+                    app.graph_options,
+                    app.domain,
+                    app.focus == app::Focus::Content,
+                    app.graph_render_profile_ms(),
+                ),
             }
             app.dirty.content = false;
         }
@@ -85,14 +103,19 @@ pub extern "C" fn main() {
         let keys = eadk::keyboard::scan();
         let editor_was_active =
             app.active_tab == app::Tab::Equation && app.focus == app::Focus::Content;
+        let settings_editor_was_active = app.active_tab == app::Tab::Settings
+            && app.focus == app::Focus::Content
+            && app.settings.is_editing();
         let tabs_were_focused = app.focus == app::Focus::Tabs;
         let update = app.update(keys);
         if update == app::UpdateResult::Exit {
             return;
         }
 
-        let semantic_input_context =
-            editor_was_active || tabs_were_focused || app.focus == app::Focus::Tabs;
+        let semantic_input_context = editor_was_active
+            || settings_editor_was_active
+            || tabs_were_focused
+            || app.focus == app::Focus::Tabs;
         if app.pressed_keys() != 0 && semantic_input_context {
             let semantic_event = poll_semantic_event(keys);
             if update == app::UpdateResult::Continue
@@ -102,9 +125,18 @@ pub extern "C" fn main() {
                 if let Some(event) = semantic_event {
                     let _ = app.handle_editor_event(event, &mut function);
                 }
+            } else if update == app::UpdateResult::Continue
+                && settings_editor_was_active
+                && app.active_tab == app::Tab::Settings
+                && app.focus == app::Focus::Content
+                && app.settings.is_editing()
+            {
+                if let Some(event) = semantic_event {
+                    let _ = app.handle_settings_event(event);
+                }
             }
         }
-        app.update_editor_repeat(keys, eadk::timing::millis(), &mut function);
+        app.update_key_repeat(keys, eadk::timing::millis(), &mut function);
         eadk::timing::msleep(20);
     }
 }

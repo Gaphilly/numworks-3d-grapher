@@ -151,6 +151,7 @@ pub mod keyboard {
     pub const BACKSPACE: u8 = 17;
     pub const PLUS: u8 = 45;
     pub const MINUS: u8 = 46;
+    pub const EXE: u8 = 52;
 
     /// Samples all physical keys without semantic Shift/Alpha translation.
     pub fn scan() -> State {

@@ -91,6 +91,11 @@ impl Camera {
         }
     }
 
+    /// Restores the established released default view without touching graph data.
+    pub fn reset(&mut self) {
+        *self = Camera::new();
+    }
+
     /// Orbits around the current target. Pitch is clamped before the camera can
     /// flip over; non-finite input is ignored.
     pub fn orbit(&mut self, yaw_delta: f32, pitch_delta: f32) {
@@ -440,5 +445,24 @@ mod tests {
         assert!(camera.target_y.is_finite());
         assert!(camera.target_z.is_finite());
         assert!(camera.focal_length.is_finite());
+    }
+
+    #[test]
+    fn reset_restores_every_camera_parameter() {
+        let mut camera = Camera::new();
+        camera.orbit(0.7, -0.4);
+        camera.truck(2.0);
+        camera.pedestal(1.0);
+        camera.dolly(3.0);
+        camera.adjust_focal_length(-30.0);
+        camera.reset();
+        let default = Camera::new();
+        assert_eq!(camera.yaw, default.yaw);
+        assert_eq!(camera.pitch, default.pitch);
+        assert_eq!(camera.distance, default.distance);
+        assert_eq!(camera.target_x, default.target_x);
+        assert_eq!(camera.target_y, default.target_y);
+        assert_eq!(camera.target_z, default.target_z);
+        assert_eq!(camera.focal_length, default.focal_length);
     }
 }

@@ -1,5 +1,15 @@
 [package]
 name = "numworks-3d-grapher"
-version = "1.0.0"
+version = "2.0.0"
 authors = ["Gabriel Bourneau"]
 edition = "2018"
+
+[profile.release-extreme]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false

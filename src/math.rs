@@ -10,14 +10,62 @@ const PI: f32 = 3.1415927;
 const HALF_PI: f32 = 1.5707964;
 const TWO_PI: f32 = 6.2831855;
 
-fn wrap_angle(mut angle: f32) -> f32 {
-    while angle > PI {
-        angle -= TWO_PI;
+/// Reduces a finite angle to approximately `[-pi, pi]` in bounded time.
+///
+/// Repeatedly adding or subtracting one period is unacceptable here: a valid
+/// expression such as `sin(1e38)` would require an effectively unbounded
+/// number of iterations on the calculator.  This reducer instead greedily
+/// subtracts binary-scaled copies of `2*pi`.  A finite `f32` has at most 127
+/// positive exponent steps, so both loops have a small fixed upper bound.
+///
+/// The usual `f32` precision limits still apply to enormous arguments.  Above
+/// the range where a float can retain sub-period detail, this is a stable,
+/// finite phase approximation rather than a correctly-rounded transcendental
+/// reduction.  Ordinary graphing angles retain the previous subtraction-based
+/// behavior to within normal `f32` rounding.
+fn wrap_angle(angle: f32) -> f32 {
+    if !angle.is_finite() {
+        return f32::NAN;
     }
-    while angle < -PI {
-        angle += TWO_PI;
+
+    let negative = angle < 0.0;
+    let mut remainder = angle.abs();
+    if remainder <= PI {
+        return angle;
     }
-    angle
+
+    // `2^127` is the largest useful finite scale for a normalized f32.  The
+    // half-magnitude condition prevents the next doubling from overflowing.
+    const MAX_BINARY_PERIOD_STEPS: u8 = 127;
+    let mut period = TWO_PI;
+    let mut steps = 0_u8;
+    while steps < MAX_BINARY_PERIOD_STEPS && period <= remainder * 0.5 {
+        period *= 2.0;
+        steps += 1;
+    }
+
+    // Process each binary multiple once.  Unlike the old loop, this is bounded
+    // even for `f32::MAX`; small periods that no longer affect a huge rounded
+    // remainder are simply harmless no-ops.
+    loop {
+        if remainder >= period {
+            remainder -= period;
+        }
+        if steps == 0 {
+            break;
+        }
+        period *= 0.5;
+        steps -= 1;
+    }
+
+    if remainder > PI {
+        remainder -= TWO_PI;
+    }
+    if negative {
+        -remainder
+    } else {
+        remainder
+    }
 }
 
 /// Returns sine and cosine together after range reduction, sharing polynomial work.
@@ -158,5 +206,40 @@ fn exp(value: f32) -> f32 {
         sum * integer_power(2.0, exponent as u32)
     } else {
         sum / integer_power(2.0, (-exponent) as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_angle_reduction_handles_large_finite_inputs() {
+        for angle in [1.0e10_f32, 1.0e20_f32, 1.0e38_f32] {
+            for signed_angle in [angle, -angle] {
+                let reduced = wrap_angle(signed_angle);
+                assert!(reduced.is_finite());
+                assert!(reduced >= -PI);
+                assert!(reduced <= PI);
+
+                let (sin, cos) = sin_cos(signed_angle);
+                assert!(sin.is_finite());
+                assert!(cos.is_finite());
+
+                let tangent = tan(signed_angle);
+                assert!(tangent.is_finite() || tangent.is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_angles_keep_the_expected_quadrants() {
+        let (sin, cos) = sin_cos(10.0);
+        assert!((sin + 0.5440).abs() < 0.002);
+        assert!((cos + 0.8391).abs() < 0.002);
+
+        let (sin, cos) = sin_cos(-10.0);
+        assert!((sin - 0.5440).abs() < 0.002);
+        assert!((cos + 0.8391).abs() < 0.002);
     }
 }

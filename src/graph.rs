@@ -10,11 +10,73 @@ use crate::surface::Domain;
 /// Hard upper bound for tick positions generated on one axis.
 pub const MAX_TICKS: usize = 12;
 
+/// Surface rasterization style selected from Settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RenderingMode {
+    /// Original low-cost row/column wire mesh.
+    Wireframe,
+    /// Lit, depth-tested filled triangles.
+    Solid,
+    /// Filled triangles with the original surface mesh drawn on top.
+    SolidGrid,
+}
+
+impl RenderingMode {
+    /// Cycles forward through the three user-visible modes.
+    pub fn next(self) -> RenderingMode {
+        match self {
+            RenderingMode::Wireframe => RenderingMode::Solid,
+            RenderingMode::Solid => RenderingMode::SolidGrid,
+            RenderingMode::SolidGrid => RenderingMode::Wireframe,
+        }
+    }
+
+    /// Cycles backward through the three user-visible modes.
+    pub fn previous(self) -> RenderingMode {
+        match self {
+            RenderingMode::Wireframe => RenderingMode::SolidGrid,
+            RenderingMode::Solid => RenderingMode::Wireframe,
+            RenderingMode::SolidGrid => RenderingMode::Solid,
+        }
+    }
+}
+
+/// Persistent graph-appearance options. These are tiny value types and changing
+/// them never requires expression recompilation or surface resampling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GraphOptions {
+    /// Height-field rasterization path.
+    pub rendering_mode: RenderingMode,
+    /// World-space grid on the XY plane; distinct from the solid surface mesh.
+    pub show_grid: bool,
+    /// World-space X/Y/Z axes and origin.
+    pub show_axes: bool,
+    /// Short world-space marks along visible axes.
+    pub show_ticks: bool,
+    /// Numeric tick values and X/Y/Z bitmap labels.
+    pub show_labels: bool,
+}
+
+impl GraphOptions {
+    /// Released defaults: wireframe with full coordinate context.
+    pub const DEFAULT: GraphOptions = GraphOptions {
+        rendering_mode: RenderingMode::Wireframe,
+        show_grid: true,
+        show_axes: true,
+        show_ticks: true,
+        show_labels: true,
+    };
+}
+
 #[derive(Clone, Copy)]
 /// Central RGB565 graph palette. Keeping colors here prevents layers from
 /// silently diverging as the visual style evolves.
 pub struct GraphPalette {
     pub background: Color,
+    /// Unlit base tint multiplied by the cached triangle light level.
+    pub solid_surface: Color,
+    /// Subtle depth-tested height-field lines used by Solid + Grid.
+    pub solid_grid: Color,
     pub surface: Color,
     pub grid: Color,
     pub x_axis: Color,
@@ -27,6 +89,8 @@ pub struct GraphPalette {
 /// Restrained default graph colors stored as 16-bit RGB565 values.
 pub const PALETTE: GraphPalette = GraphPalette {
     background: Color { rgb565: 0xffff },
+    solid_surface: Color { rgb565: 0x2d9f },
+    solid_grid: Color { rgb565: 0x10b0 },
     surface: Color { rgb565: 0x001f },
     grid: Color { rgb565: 0xd69a },
     x_axis: Color { rgb565: 0xb800 },
@@ -180,5 +244,16 @@ mod tests {
         let domain = Domain::new(-3.1415927, 3.1415927, -3.1415927, 3.1415927);
         assert_eq!(grid_line_count(domain), 12);
         assert!(grid_line_count(Domain::new(-100.0, 100.0, -100.0, 100.0)) <= MAX_TICKS * 2);
+    }
+
+    #[test]
+    fn rendering_modes_cycle_in_both_directions() {
+        assert_eq!(RenderingMode::Wireframe.next(), RenderingMode::Solid);
+        assert_eq!(RenderingMode::Solid.next(), RenderingMode::SolidGrid);
+        assert_eq!(RenderingMode::SolidGrid.next(), RenderingMode::Wireframe);
+        assert_eq!(
+            RenderingMode::Wireframe.previous(),
+            RenderingMode::SolidGrid
+        );
     }
 }

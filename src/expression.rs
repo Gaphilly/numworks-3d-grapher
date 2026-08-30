@@ -666,6 +666,34 @@ mod tests {
     }
 
     #[test]
+    fn trigonometric_expressions_finish_for_large_finite_arguments() {
+        let sine = CompiledExpression::compile("sin(x)").expect("valid sine expression");
+        let cosine = CompiledExpression::compile("cos(x)").expect("valid cosine expression");
+        let tangent = CompiledExpression::compile("tan(x)").expect("valid tangent expression");
+
+        for argument in [1.0e10_f32, 1.0e20_f32, 1.0e38_f32] {
+            for signed_argument in [argument, -argument] {
+                assert!(sine
+                    .evaluate_checked(signed_argument, 0.0)
+                    .expect("bounded sine result")
+                    .is_finite());
+                assert!(cosine
+                    .evaluate_checked(signed_argument, 0.0)
+                    .expect("bounded cosine result")
+                    .is_finite());
+
+                // The tangent policy deliberately rejects values close to a
+                // pole, but a large finite input must always return promptly.
+                match tangent.evaluate_checked(signed_argument, 0.0) {
+                    Ok(value) => assert!(value.is_finite()),
+                    Err(EvaluationError::NonFiniteResult) => {}
+                    Err(error) => panic!("unexpected tangent error: {:?}", error),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fixed_capacity_limits_are_reported() {
         let too_long = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         assert!(matches!(

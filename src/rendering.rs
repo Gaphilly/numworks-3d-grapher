@@ -1,20 +1,25 @@
-//! Allocation-free wireframe graph renderer for the 320×240 RGB565 display.
+//! Allocation-free wireframe and solid graph renderer for the 320×240 RGB565 display.
 //!
 //! The 24-pixel header leaves a 320×216 graph viewport. Rendering walks that
 //! viewport in 320×8 bands (2,560 pixels / 5,120 bytes), producing exactly 27
 //! display transfers without a 153,600-byte full-screen framebuffer or depth
-//! buffer. The sampled surface is projected once into a 25×19 screen-point cache.
+//! buffer. Solid modes add only a same-sized 16-bit depth band; they never
+//! allocate a full-screen color or depth buffer. The regular 25×19 height field
+//! is traversed directly as 864 triangles rather than expanded into a mesh.
 //!
 //! Composition order is deliberately repeated inside every band: clear, grid,
-//! axes, label backgrounds, numeric glyphs, surface wireframe, ticks/origin,
-//! axis glyphs, then push. Graph labels must remain in this buffer. Drawing text
-//! directly to the display between band transfers can expose stale positions or
-//! overwrite labels with later bands, reintroducing the hardware flashing bug.
+//! axes, label backgrounds, numeric glyphs, surface, optional visible surface
+//! grid, ticks/origin, axis glyphs, then push. Graph labels must remain in this
+//! buffer. Drawing text directly to the display between band transfers can expose
+//! stale positions or overwrite labels with later bands, reintroducing the
+//! hardware flashing bug.
 
 use crate::camera::{Camera, ProjectedLine, ProjectedPoint, Projector, ScreenPoint};
 use crate::eadk::{self, Color, Rect};
-use crate::graph::{self, AxisVisibility, TickGenerator, PALETTE};
-use crate::surface::{Domain, Point3, SurfaceGrid, COLUMNS, ROWS};
+use crate::graph::{self, AxisVisibility, GraphOptions, RenderingMode, TickGenerator, PALETTE};
+use crate::surface::{
+    Domain, Point3, SurfaceGrid, TriangleShades, COLUMNS, ROWS, TRIANGLES_PER_CELL,
+};
 
 const SCREEN_WIDTH: usize = 320;
 const SCREEN_HEIGHT: usize = 240;
@@ -31,6 +36,11 @@ const LABEL_SEPARATION: i32 = 2;
 const MAX_NUMERIC_LABELS_PER_AXIS: usize = 3;
 const MIN_NUMERIC_SURFACE_DISTANCE_SQUARED: i32 = 9;
 const MIN_AXIS_SURFACE_DISTANCE_SQUARED: i32 = 4;
+const SOLID_NEAR_DEPTH: f32 = 1.05;
+const DEPTH_KEY_MAX: f32 = u16::MAX as f32;
+const SURFACE_GRID_DEPTH_TOLERANCE: u16 = 24;
+#[cfg(test)]
+const SURFACE_GRID_EDGE_COUNT: usize = ROWS * (COLUMNS - 1) + COLUMNS * (ROWS - 1);
 
 const NUMERIC_GLYPHS: [[u8; 7]; 13] = [
     [
@@ -158,6 +168,45 @@ struct WorldGeometry {
     origin: Option<ScreenPoint>,
 }
 
+/// Compact projected sample used only by solid modes. A zero reciprocal-depth
+/// key is invalid; otherwise larger keys are nearer to the camera. Keeping the
+/// key quantized avoids another 1,900-byte `f32` array.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SolidVertex {
+    screen: ScreenPoint,
+    inverse_depth: u16,
+}
+
+impl SolidVertex {
+    const INVALID: SolidVertex = SolidVertex {
+        screen: ScreenPoint::INVALID,
+        inverse_depth: 0,
+    };
+
+    fn is_visible(self) -> bool {
+        self.screen.is_visible() && self.inverse_depth != 0
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProjectedSurface<'a> {
+    Wireframe(&'a [[ScreenPoint; COLUMNS]; ROWS]),
+    Solid(&'a [[SolidVertex; COLUMNS]; ROWS]),
+}
+
+impl ProjectedSurface<'_> {
+    fn screen(self, row: usize, column: usize) -> ScreenPoint {
+        if row >= ROWS || column >= COLUMNS {
+            return ScreenPoint::INVALID;
+        }
+        match self {
+            ProjectedSurface::Wireframe(points) => points[row][column],
+            ProjectedSurface::Solid(points) => points[row][column].screen,
+        }
+    }
+}
+
 impl WorldGeometry {
     fn new() -> WorldGeometry {
         WorldGeometry {
@@ -170,12 +219,34 @@ impl WorldGeometry {
     }
 
     fn add_line(&mut self, line: Option<ProjectedLine>, color: Color, layer: LineLayer) {
-        if self.line_count >= MAX_WORLD_LINES {
-            return;
-        }
         if let Some(line) = line {
-            self.lines[self.line_count] = Some(ColoredLine { line, color, layer });
-            self.line_count += 1;
+            let candidate = ColoredLine { line, color, layer };
+            if self.line_count < MAX_WORLD_LINES {
+                self.lines[self.line_count] = Some(candidate);
+                self.line_count += 1;
+                return;
+            }
+
+            // The auxiliary grid is intentionally expendable. If a bounded
+            // tick/grid configuration ever fills this array, keep X/Y/Z axes
+            // visible by replacing one grid line rather than silently dropping
+            // the mathematical coordinate system.
+            if layer == LineLayer::Axis {
+                let mut index = 0;
+                while index < self.line_count {
+                    if matches!(
+                        self.lines[index],
+                        Some(ColoredLine {
+                            layer: LineLayer::Grid,
+                            ..
+                        })
+                    ) {
+                        self.lines[index] = Some(candidate);
+                        return;
+                    }
+                    index += 1;
+                }
+            }
         }
     }
 
@@ -226,7 +297,21 @@ impl WorldGeometry {
 ///
 /// Camera-only redraws reuse `surface`; expression evaluation belongs to the
 /// surface-dirty path in `main`, not this projection/rasterization function.
-pub fn render(camera: &Camera, domain: Domain, surface: &SurfaceGrid) {
+/// Wireframe and solid paths are separate so wireframe never pays the solid
+/// mode's 5,120-byte depth-band stack cost.
+pub fn render(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options: GraphOptions) {
+    match options.rendering_mode {
+        RenderingMode::Wireframe => render_wireframe(camera, domain, surface, options),
+        RenderingMode::Solid | RenderingMode::SolidGrid => {
+            render_solid(camera, domain, surface, options)
+        }
+    }
+}
+
+// Prevent release LTO from merging the mutually exclusive stack frames: the
+// wireframe call must never reserve the depth/lighting storage used by solid.
+#[inline(never)]
+fn render_wireframe(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options: GraphOptions) {
     // A sentinel-based cache is smaller than an Option-rich structure and lets
     // both row and column wire passes reuse every projected sample.
     let mut projected = [[ScreenPoint::INVALID; COLUMNS]; ROWS];
@@ -243,7 +328,15 @@ pub fn render(camera: &Camera, domain: Domain, surface: &SurfaceGrid) {
         row += 1;
     }
 
-    let geometry = build_world_geometry(&projector, domain, z_min, z_max, has_height, &projected);
+    let geometry = build_world_geometry(
+        &projector,
+        domain,
+        z_min,
+        z_max,
+        has_height,
+        ProjectedSurface::Wireframe(&projected),
+        options,
+    );
 
     eadk::display::wait_for_vblank();
     let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
@@ -256,7 +349,86 @@ pub fn render(camera: &Camera, domain: Domain, surface: &SurfaceGrid) {
         draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Axis);
         draw_label_backgrounds(&mut pixels, band_y, &geometry);
         draw_labels(&mut pixels, band_y, &geometry, true);
-        draw_surface(&mut pixels, band_y, &projected);
+        draw_wireframe_surface(&mut pixels, band_y, &projected);
+        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
+        draw_origin(&mut pixels, band_y, geometry.origin);
+        draw_labels(&mut pixels, band_y, &geometry, false);
+
+        eadk::display::push_rect(
+            Rect {
+                x: 0,
+                y: band_y as u16,
+                width: SCREEN_WIDTH as u16,
+                height: BAND_HEIGHT as u16,
+            },
+            &pixels,
+        );
+        band_y += BAND_HEIGHT;
+    }
+}
+
+#[inline(never)]
+fn render_solid(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options: GraphOptions) {
+    // Lighting is solid-only transient state. Keeping it in this separate call
+    // path prevents both its calculation and its 864-byte stack allocation from
+    // affecting the established wireframe renderer.
+    let mut triangle_shades = [[[0_u8; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
+    surface.build_triangle_shades(domain, &mut triangle_shades);
+    let mut projected = [[SolidVertex::INVALID; COLUMNS]; ROWS];
+    let projector = camera.projector();
+    let (z_min, z_max, has_height) = surface.z_range();
+    let mut row = 0;
+    while row < ROWS {
+        let mut column = 0;
+        while column < COLUMNS {
+            let point = surface.point(domain, column, row);
+            if let Some(point) = projector.project_with_depth(point) {
+                let inverse_depth = encode_inverse_depth(point.depth);
+                if inverse_depth != 0 {
+                    projected[row][column] = SolidVertex {
+                        screen: point.screen,
+                        inverse_depth,
+                    };
+                }
+            }
+            column += 1;
+        }
+        row += 1;
+    }
+
+    let geometry = build_world_geometry(
+        &projector,
+        domain,
+        z_min,
+        z_max,
+        has_height,
+        ProjectedSurface::Solid(&projected),
+        options,
+    );
+
+    eadk::display::wait_for_vblank();
+    let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+    let mut depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+    let mut band_y = GRAPH_TOP;
+    while band_y < SCREEN_HEIGHT {
+        // The color and depth slices describe the same eight physical rows and
+        // are both reset before composing that band from one camera state.
+        pixels.fill(PALETTE.background);
+        depth.fill(0);
+        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Grid);
+        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Axis);
+        draw_label_backgrounds(&mut pixels, band_y, &geometry);
+        draw_labels(&mut pixels, band_y, &geometry, true);
+        draw_solid_surface(
+            &mut pixels,
+            &mut depth,
+            band_y,
+            &projected,
+            &triangle_shades,
+        );
+        if options.rendering_mode == RenderingMode::SolidGrid {
+            draw_depth_surface_grid(&mut pixels, &depth, band_y, &projected, &triangle_shades);
+        }
         draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
         draw_origin(&mut pixels, band_y, geometry.origin);
         draw_labels(&mut pixels, band_y, &geometry, false);
@@ -280,22 +452,28 @@ fn build_world_geometry(
     surface_z_min: f32,
     surface_z_max: f32,
     has_height: bool,
-    projected_surface: &[[ScreenPoint; COLUMNS]; ROWS],
+    projected_surface: ProjectedSurface<'_>,
+    options: GraphOptions,
 ) -> WorldGeometry {
     let mut geometry = WorldGeometry::new();
     let visibility = graph::axes_for_domain(domain);
     let (z_min, z_max) = z_axis_range(surface_z_min, surface_z_max, has_height);
-    add_grid(&mut geometry, projector, domain);
-    add_axes(
-        &mut geometry,
-        projector,
-        domain,
-        z_min,
-        z_max,
-        visibility,
-        projected_surface,
-    );
-    if visibility.z {
+    if options.show_grid {
+        add_grid(&mut geometry, projector, domain);
+    }
+    if options.show_axes {
+        add_axes(
+            &mut geometry,
+            projector,
+            domain,
+            z_min,
+            z_max,
+            visibility,
+            projected_surface,
+            options,
+        );
+    }
+    if options.show_axes && visibility.z {
         geometry.origin = visible_point(projector.project(Point3 {
             x: 0.0,
             y: 0.0,
@@ -357,7 +535,8 @@ fn add_axes(
     z_min: f32,
     z_max: f32,
     visibility: AxisVisibility,
-    projected_surface: &[[ScreenPoint; COLUMNS]; ROWS],
+    projected_surface: ProjectedSurface<'_>,
+    options: GraphOptions,
 ) {
     let tick_size = domain_tick_size(domain);
     if visibility.x {
@@ -377,19 +556,30 @@ fn add_axes(
             PALETTE.x_axis,
             LineLayer::Axis,
         );
-        add_x_ticks(geometry, projector, domain, tick_size, projected_surface);
-        let projected = projector.project_with_depth(Point3 {
-            x: domain.x_max,
-            y: 0.0,
-            z: 0.0,
-        });
-        add_axis_label(
-            geometry,
-            projected,
-            LabelKind::AxisX,
-            PALETTE.x_axis,
-            projected_surface,
-        );
+        if options.show_ticks || options.show_labels {
+            add_x_ticks(
+                geometry,
+                projector,
+                domain,
+                tick_size,
+                projected_surface,
+                options,
+            );
+        }
+        if options.show_labels {
+            let projected = projector.project_with_depth(Point3 {
+                x: domain.x_max,
+                y: 0.0,
+                z: 0.0,
+            });
+            add_axis_label(
+                geometry,
+                projected,
+                LabelKind::AxisX,
+                PALETTE.x_axis,
+                projected_surface,
+            );
+        }
     }
     if visibility.y {
         geometry.add_line(
@@ -408,19 +598,30 @@ fn add_axes(
             PALETTE.y_axis,
             LineLayer::Axis,
         );
-        add_y_ticks(geometry, projector, domain, tick_size, projected_surface);
-        let projected = projector.project_with_depth(Point3 {
-            x: 0.0,
-            y: domain.y_max,
-            z: 0.0,
-        });
-        add_axis_label(
-            geometry,
-            projected,
-            LabelKind::AxisY,
-            PALETTE.y_axis,
-            projected_surface,
-        );
+        if options.show_ticks || options.show_labels {
+            add_y_ticks(
+                geometry,
+                projector,
+                domain,
+                tick_size,
+                projected_surface,
+                options,
+            );
+        }
+        if options.show_labels {
+            let projected = projector.project_with_depth(Point3 {
+                x: 0.0,
+                y: domain.y_max,
+                z: 0.0,
+            });
+            add_axis_label(
+                geometry,
+                projected,
+                LabelKind::AxisY,
+                PALETTE.y_axis,
+                projected_surface,
+            );
+        }
     }
     if visibility.z {
         geometry.add_line(
@@ -439,26 +640,31 @@ fn add_axes(
             PALETTE.z_axis,
             LineLayer::Axis,
         );
-        add_z_ticks(
-            geometry,
-            projector,
-            z_min,
-            z_max,
-            tick_size,
-            projected_surface,
-        );
-        let projected = projector.project_with_depth(Point3 {
-            x: 0.0,
-            y: 0.0,
-            z: z_max,
-        });
-        add_axis_label(
-            geometry,
-            projected,
-            LabelKind::AxisZ,
-            PALETTE.z_axis,
-            projected_surface,
-        );
+        if options.show_ticks || options.show_labels {
+            add_z_ticks(
+                geometry,
+                projector,
+                z_min,
+                z_max,
+                tick_size,
+                projected_surface,
+                options,
+            );
+        }
+        if options.show_labels {
+            let projected = projector.project_with_depth(Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: z_max,
+            });
+            add_axis_label(
+                geometry,
+                projected,
+                LabelKind::AxisZ,
+                PALETTE.z_axis,
+                projected_surface,
+            );
+        }
     }
 }
 
@@ -467,22 +673,25 @@ fn add_x_ticks(
     projector: &Projector,
     domain: Domain,
     tick_size: f32,
-    projected_surface: &[[ScreenPoint; COLUMNS]; ROWS],
+    projected_surface: ProjectedSurface<'_>,
+    options: GraphOptions,
 ) {
     let mut ticks = TickGenerator::new(domain.x_min, domain.x_max);
     let mut candidates = NumericCandidates::new();
     while let Some(x) = ticks.next() {
-        consider_numeric_candidate(
-            &mut candidates,
-            projector.project_with_depth(Point3 {
+        if options.show_labels {
+            consider_numeric_candidate(
+                &mut candidates,
+                projector.project_with_depth(Point3 {
+                    x,
+                    y: -tick_size * 1.6,
+                    z: 0.0,
+                }),
                 x,
-                y: -tick_size * 1.6,
-                z: 0.0,
-            }),
-            x,
-            projected_surface,
-        );
-        if x != 0.0 {
+                projected_surface,
+            );
+        }
+        if options.show_ticks && x != 0.0 {
             geometry.add_line(
                 projector.project_line(
                     Point3 {
@@ -501,7 +710,9 @@ fn add_x_ticks(
             );
         }
     }
-    select_numeric_labels(geometry, &mut candidates);
+    if options.show_labels {
+        select_numeric_labels(geometry, &mut candidates);
+    }
 }
 
 fn add_y_ticks(
@@ -509,22 +720,25 @@ fn add_y_ticks(
     projector: &Projector,
     domain: Domain,
     tick_size: f32,
-    projected_surface: &[[ScreenPoint; COLUMNS]; ROWS],
+    projected_surface: ProjectedSurface<'_>,
+    options: GraphOptions,
 ) {
     let mut ticks = TickGenerator::new(domain.y_min, domain.y_max);
     let mut candidates = NumericCandidates::new();
     while let Some(y) = ticks.next() {
-        consider_numeric_candidate(
-            &mut candidates,
-            projector.project_with_depth(Point3 {
-                x: tick_size * 1.6,
+        if options.show_labels {
+            consider_numeric_candidate(
+                &mut candidates,
+                projector.project_with_depth(Point3 {
+                    x: tick_size * 1.6,
+                    y,
+                    z: 0.0,
+                }),
                 y,
-                z: 0.0,
-            }),
-            y,
-            projected_surface,
-        );
-        if y != 0.0 {
+                projected_surface,
+            );
+        }
+        if options.show_ticks && y != 0.0 {
             geometry.add_line(
                 projector.project_line(
                     Point3 {
@@ -543,7 +757,9 @@ fn add_y_ticks(
             );
         }
     }
-    select_numeric_labels(geometry, &mut candidates);
+    if options.show_labels {
+        select_numeric_labels(geometry, &mut candidates);
+    }
 }
 
 fn add_z_ticks(
@@ -552,22 +768,25 @@ fn add_z_ticks(
     z_min: f32,
     z_max: f32,
     tick_size: f32,
-    projected_surface: &[[ScreenPoint; COLUMNS]; ROWS],
+    projected_surface: ProjectedSurface<'_>,
+    options: GraphOptions,
 ) {
     let mut ticks = TickGenerator::new(z_min, z_max);
     let mut candidates = NumericCandidates::new();
     while let Some(z) = ticks.next() {
-        consider_numeric_candidate(
-            &mut candidates,
-            projector.project_with_depth(Point3 {
-                x: tick_size * 1.6,
-                y: 0.0,
+        if options.show_labels {
+            consider_numeric_candidate(
+                &mut candidates,
+                projector.project_with_depth(Point3 {
+                    x: tick_size * 1.6,
+                    y: 0.0,
+                    z,
+                }),
                 z,
-            }),
-            z,
-            projected_surface,
-        );
-        if z != 0.0 {
+                projected_surface,
+            );
+        }
+        if options.show_ticks && z != 0.0 {
             geometry.add_line(
                 projector.project_line(
                     Point3 {
@@ -586,14 +805,16 @@ fn add_z_ticks(
             );
         }
     }
-    select_numeric_labels(geometry, &mut candidates);
+    if options.show_labels {
+        select_numeric_labels(geometry, &mut candidates);
+    }
 }
 
 fn consider_numeric_candidate(
     candidates: &mut NumericCandidates,
     projected: Option<ProjectedPoint>,
     value: f32,
-    projected_surface: &[[ScreenPoint; COLUMNS]; ROWS],
+    projected_surface: ProjectedSurface<'_>,
 ) {
     let projected = match projected {
         Some(projected) => projected,
@@ -687,7 +908,7 @@ fn add_axis_label(
     projected: Option<ProjectedPoint>,
     kind: LabelKind,
     color: Color,
-    projected_surface: &[[ScreenPoint; COLUMNS]; ROWS],
+    projected_surface: ProjectedSurface<'_>,
 ) {
     let projected = match projected {
         Some(projected) => projected,
@@ -702,7 +923,11 @@ fn add_axis_label(
     }
 }
 
-fn draw_surface(pixels: &mut [Color], band_y: usize, projected: &[[ScreenPoint; COLUMNS]; ROWS]) {
+fn draw_wireframe_surface(
+    pixels: &mut [Color],
+    band_y: usize,
+    projected: &[[ScreenPoint; COLUMNS]; ROWS],
+) {
     let mut row = 0;
     while row < ROWS {
         let mut column = 0;
@@ -728,6 +953,357 @@ fn draw_surface(pixels: &mut [Color], band_y: usize, projected: &[[ScreenPoint; 
             column += 1;
         }
         row += 1;
+    }
+}
+
+fn draw_solid_surface(
+    pixels: &mut [Color],
+    depth: &mut [u16],
+    band_y: usize,
+    projected: &[[SolidVertex; COLUMNS]; ROWS],
+    triangle_shades: &TriangleShades,
+) {
+    let mut row = 0;
+    while row + 1 < ROWS {
+        let mut column = 0;
+        while column + 1 < COLUMNS {
+            let shade = triangle_shades[row][column][0];
+            if shade != 0 {
+                draw_triangle_band(
+                    pixels,
+                    depth,
+                    band_y,
+                    [
+                        projected[row][column],
+                        projected[row][column + 1],
+                        projected[row + 1][column + 1],
+                    ],
+                    shaded_surface_color(shade),
+                );
+            }
+            let shade = triangle_shades[row][column][1];
+            if shade != 0 {
+                draw_triangle_band(
+                    pixels,
+                    depth,
+                    band_y,
+                    [
+                        projected[row][column],
+                        projected[row + 1][column + 1],
+                        projected[row + 1][column],
+                    ],
+                    shaded_surface_color(shade),
+                );
+            }
+            column += 1;
+        }
+        row += 1;
+    }
+}
+
+/// Fills one projected triangle only inside the active eight-row band.
+///
+/// Integer edge equations use doubled pixel-center coordinates and are stepped
+/// with additions across each row. The reciprocal-depth plane is likewise
+/// initialized once and incremented in X/Y. This avoids three edge-function
+/// evaluations and a division for every covered pixel on the calculator CPU.
+fn draw_triangle_band(
+    pixels: &mut [Color],
+    depth: &mut [u16],
+    band_y: usize,
+    mut vertices: [SolidVertex; 3],
+    color: Color,
+) {
+    if pixels.len() < SCREEN_WIDTH * BAND_HEIGHT
+        || depth.len() < SCREEN_WIDTH * BAND_HEIGHT
+        || !vertices[0].is_visible()
+        || !vertices[1].is_visible()
+        || !vertices[2].is_visible()
+    {
+        return;
+    }
+
+    let mut area = edge_at_vertex(vertices[0].screen, vertices[1].screen, vertices[2].screen);
+    if area == 0 {
+        return;
+    }
+    if area < 0 {
+        vertices.swap(1, 2);
+        area = -area;
+    }
+
+    let minimum_x = minimum3(
+        vertices[0].screen.x as i32,
+        vertices[1].screen.x as i32,
+        vertices[2].screen.x as i32,
+    )
+    .max(0);
+    let maximum_x = maximum3(
+        vertices[0].screen.x as i32,
+        vertices[1].screen.x as i32,
+        vertices[2].screen.x as i32,
+    )
+    .min(SCREEN_WIDTH as i32 - 1);
+    let minimum_y = minimum3(
+        vertices[0].screen.y as i32,
+        vertices[1].screen.y as i32,
+        vertices[2].screen.y as i32,
+    )
+    .max(band_y as i32);
+    let maximum_y = maximum3(
+        vertices[0].screen.y as i32,
+        vertices[1].screen.y as i32,
+        vertices[2].screen.y as i32,
+    )
+    .min((band_y + BAND_HEIGHT - 1) as i32);
+    if minimum_x > maximum_x || minimum_y > maximum_y {
+        return;
+    }
+
+    // Each pixel-center edge value is twice its ordinary integer-coordinate
+    // value, so the three barycentric weights sum to `2 * area`.
+    let doubled_area = area.saturating_mul(2);
+    if doubled_area <= 0 {
+        return;
+    }
+    let reciprocal_area = 1.0 / doubled_area as f32;
+
+    let edge_0_x = -2 * (vertices[2].screen.y as i32 - vertices[1].screen.y as i32);
+    let edge_1_x = -2 * (vertices[0].screen.y as i32 - vertices[2].screen.y as i32);
+    let edge_2_x = -2 * (vertices[1].screen.y as i32 - vertices[0].screen.y as i32);
+    let edge_0_y = 2 * (vertices[2].screen.x as i32 - vertices[1].screen.x as i32);
+    let edge_1_y = 2 * (vertices[0].screen.x as i32 - vertices[2].screen.x as i32);
+    let edge_2_y = 2 * (vertices[1].screen.x as i32 - vertices[0].screen.x as i32);
+
+    let mut row_weight_0 =
+        edge_at_pixel_center(vertices[1].screen, vertices[2].screen, minimum_x, minimum_y);
+    let mut row_weight_1 =
+        edge_at_pixel_center(vertices[2].screen, vertices[0].screen, minimum_x, minimum_y);
+    let mut row_weight_2 =
+        edge_at_pixel_center(vertices[0].screen, vertices[1].screen, minimum_x, minimum_y);
+    let depth_0 = vertices[0].inverse_depth as f32;
+    let depth_1 = vertices[1].inverse_depth as f32;
+    let depth_2 = vertices[2].inverse_depth as f32;
+    let mut row_depth = (row_weight_0 as f32 * depth_0
+        + row_weight_1 as f32 * depth_1
+        + row_weight_2 as f32 * depth_2)
+        * reciprocal_area;
+    let depth_step_x =
+        (edge_0_x as f32 * depth_0 + edge_1_x as f32 * depth_1 + edge_2_x as f32 * depth_2)
+            * reciprocal_area;
+    let depth_step_y =
+        (edge_0_y as f32 * depth_0 + edge_1_y as f32 * depth_1 + edge_2_y as f32 * depth_2)
+            * reciprocal_area;
+
+    let mut y = minimum_y;
+    while y <= maximum_y {
+        let mut weight_0 = row_weight_0;
+        let mut weight_1 = row_weight_1;
+        let mut weight_2 = row_weight_2;
+        let mut interpolated_depth = row_depth;
+        let mut x = minimum_x;
+        while x <= maximum_x {
+            if weight_0 >= 0 && weight_1 >= 0 && weight_2 >= 0 {
+                if interpolated_depth.is_finite() && interpolated_depth > 0.0 {
+                    let key = interpolated_depth.min(DEPTH_KEY_MAX) as u16;
+                    let local_y = y as usize - band_y;
+                    let index = local_y * SCREEN_WIDTH + x as usize;
+                    if index < depth.len() && key > depth[index] {
+                        depth[index] = key;
+                        pixels[index] = color;
+                    }
+                }
+            }
+            weight_0 += edge_0_x;
+            weight_1 += edge_1_x;
+            weight_2 += edge_2_x;
+            interpolated_depth += depth_step_x;
+            x += 1;
+        }
+        row_weight_0 += edge_0_y;
+        row_weight_1 += edge_1_y;
+        row_weight_2 += edge_2_y;
+        row_depth += depth_step_y;
+        y += 1;
+    }
+}
+
+fn draw_depth_surface_grid(
+    pixels: &mut [Color],
+    depth: &[u16],
+    band_y: usize,
+    projected: &[[SolidVertex; COLUMNS]; ROWS],
+    triangle_shades: &TriangleShades,
+) {
+    let mut row = 0;
+    while row < ROWS {
+        let mut column = 0;
+        while column < COLUMNS {
+            if column + 1 < COLUMNS
+                && horizontal_surface_edge_is_valid(triangle_shades, row, column)
+            {
+                draw_depth_line(
+                    pixels,
+                    depth,
+                    band_y,
+                    projected[row][column],
+                    projected[row][column + 1],
+                    PALETTE.solid_grid,
+                );
+            }
+            if row + 1 < ROWS && vertical_surface_edge_is_valid(triangle_shades, row, column) {
+                draw_depth_line(
+                    pixels,
+                    depth,
+                    band_y,
+                    projected[row][column],
+                    projected[row + 1][column],
+                    PALETTE.solid_grid,
+                );
+            }
+            column += 1;
+        }
+        row += 1;
+    }
+}
+
+fn horizontal_surface_edge_is_valid(
+    triangle_shades: &TriangleShades,
+    row: usize,
+    column: usize,
+) -> bool {
+    if row >= ROWS || column + 1 >= COLUMNS {
+        return false;
+    }
+    (row + 1 < ROWS && triangle_shades[row][column][0] != 0)
+        || (row > 0 && triangle_shades[row - 1][column][1] != 0)
+}
+
+fn vertical_surface_edge_is_valid(
+    triangle_shades: &TriangleShades,
+    row: usize,
+    column: usize,
+) -> bool {
+    if row + 1 >= ROWS || column >= COLUMNS {
+        return false;
+    }
+    (column + 1 < COLUMNS && triangle_shades[row][column][1] != 0)
+        || (column > 0 && triangle_shades[row][column - 1][0] != 0)
+}
+
+/// Draws only portions of a surface edge whose reciprocal depth matches the
+/// visible fill. Back-facing grid edges therefore do not show through solid
+/// triangles and turn the result back into an opaque wireframe.
+fn draw_depth_line(
+    pixels: &mut [Color],
+    depth: &[u16],
+    band_y: usize,
+    start: SolidVertex,
+    end: SolidVertex,
+    color: Color,
+) {
+    if !start.is_visible() || !end.is_visible() {
+        return;
+    }
+    let band_bottom = band_y as i32 + BAND_HEIGHT as i32 - 1;
+    let min_y = (start.screen.y.min(end.screen.y)) as i32;
+    let max_y = (start.screen.y.max(end.screen.y)) as i32;
+    if max_y < band_y as i32 || min_y > band_bottom {
+        return;
+    }
+
+    let mut x0 = start.screen.x as i32;
+    let mut y0 = start.screen.y as i32;
+    let x1 = end.screen.x as i32;
+    let y1 = end.screen.y as i32;
+    let dx = (x1 - x0).abs();
+    let dy_absolute = (y1 - y0).abs();
+    let steps = dx.max(dy_absolute) as u32;
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -dy_absolute;
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    let mut step = 0_u32;
+    loop {
+        if x0 >= 0 && x0 < SCREEN_WIDTH as i32 && y0 >= band_y as i32 && y0 <= band_bottom {
+            let key = if steps == 0 {
+                start.inverse_depth
+            } else {
+                let start_weight = steps - step.min(steps);
+                let end_weight = step.min(steps);
+                ((start.inverse_depth as u32 * start_weight
+                    + end.inverse_depth as u32 * end_weight)
+                    / steps) as u16
+            };
+            let local_y = y0 as usize - band_y;
+            let index = local_y * SCREEN_WIDTH + x0 as usize;
+            if index < pixels.len()
+                && index < depth.len()
+                && key.saturating_add(SURFACE_GRID_DEPTH_TOLERANCE) >= depth[index]
+            {
+                pixels[index] = color;
+            }
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let twice_error = 2 * error;
+        if twice_error >= dy {
+            error += dy;
+            x0 += sx;
+        }
+        if twice_error <= dx {
+            error += dx;
+            y0 += sy;
+        }
+        step = step.saturating_add(1);
+    }
+}
+
+fn edge_at_vertex(start: ScreenPoint, end: ScreenPoint, point: ScreenPoint) -> i32 {
+    let delta_x = end.x as i32 - start.x as i32;
+    let delta_y = end.y as i32 - start.y as i32;
+    delta_x * (point.y as i32 - start.y as i32) - delta_y * (point.x as i32 - start.x as i32)
+}
+
+fn edge_at_pixel_center(start: ScreenPoint, end: ScreenPoint, pixel_x: i32, pixel_y: i32) -> i32 {
+    let delta_x = end.x as i32 - start.x as i32;
+    let delta_y = end.y as i32 - start.y as i32;
+    let relative_x_twice = pixel_x * 2 + 1 - start.x as i32 * 2;
+    let relative_y_twice = pixel_y * 2 + 1 - start.y as i32 * 2;
+    delta_x * relative_y_twice - delta_y * relative_x_twice
+}
+
+fn minimum3(first: i32, second: i32, third: i32) -> i32 {
+    first.min(second).min(third)
+}
+
+fn maximum3(first: i32, second: i32, third: i32) -> i32 {
+    first.max(second).max(third)
+}
+
+fn encode_inverse_depth(depth: f32) -> u16 {
+    if !depth.is_finite() || depth < SOLID_NEAR_DEPTH {
+        return 0;
+    }
+    let normalized = SOLID_NEAR_DEPTH / depth;
+    if !normalized.is_finite() || normalized <= 0.0 {
+        0
+    } else {
+        let encoded = (normalized.min(1.0) * (DEPTH_KEY_MAX - 1.0)) as u16;
+        encoded.saturating_add(1)
+    }
+}
+
+fn shaded_surface_color(shade: u8) -> Color {
+    let red = ((PALETTE.solid_surface.rgb565 >> 11) & 0x1f) as u32;
+    let green = ((PALETTE.solid_surface.rgb565 >> 5) & 0x3f) as u32;
+    let blue = (PALETTE.solid_surface.rgb565 & 0x1f) as u32;
+    let shade = shade as u32;
+    Color {
+        rgb565: (((red * shade / 255) as u16) << 11)
+            | (((green * shade / 255) as u16) << 5)
+            | (blue * shade / 255) as u16,
     }
 }
 
@@ -961,16 +1537,13 @@ fn label_rects_overlap(first: LabelRect, second: LabelRect, separation: i32) -> 
         && first.bottom >= second.top
 }
 
-fn surface_distance_squared(
-    rect: LabelRect,
-    projected_surface: &[[ScreenPoint; COLUMNS]; ROWS],
-) -> i32 {
+fn surface_distance_squared(rect: LabelRect, projected_surface: ProjectedSurface<'_>) -> i32 {
     let mut minimum = i32::MAX;
     let mut row = 0;
     while row < ROWS {
         let mut column = 0;
         while column < COLUMNS {
-            let point = projected_surface[row][column];
+            let point = projected_surface.screen(row, column);
             if point.is_visible() {
                 let x = point.x as i32;
                 let y = point.y as i32;
@@ -1176,7 +1749,8 @@ mod tests {
             -1.0,
             1.0,
             true,
-            &surface,
+            ProjectedSurface::Wireframe(&surface),
+            GraphOptions::DEFAULT,
         );
         let mut numeric = 0;
         let mut index = 0;
@@ -1206,7 +1780,8 @@ mod tests {
             -1.0,
             1.0,
             true,
-            &surface,
+            ProjectedSurface::Wireframe(&surface),
+            GraphOptions::DEFAULT,
         );
         let second = build_world_geometry(
             &camera.projector(),
@@ -1214,7 +1789,8 @@ mod tests {
             -1.0,
             1.0,
             true,
-            &surface,
+            ProjectedSurface::Wireframe(&surface),
+            GraphOptions::DEFAULT,
         );
         assert_eq!(first.label_count, second.label_count);
         assert_eq!(first.labels, second.labels);
@@ -1230,6 +1806,43 @@ mod tests {
         assert!(geometry.add_label(projected, LabelKind::AxisX, PALETTE.x_axis));
         assert!(!geometry.add_label(projected, LabelKind::AxisX, PALETTE.x_axis));
         assert_eq!(geometry.label_count, 1);
+    }
+
+    #[test]
+    fn axes_replace_expendable_grid_lines_when_geometry_capacity_is_full() {
+        let line = Some(ProjectedLine {
+            start: ScreenPoint { x: 20, y: 40 },
+            end: ScreenPoint { x: 40, y: 40 },
+        });
+        let mut geometry = WorldGeometry::new();
+        let mut index = 0;
+        while index < MAX_WORLD_LINES {
+            geometry.add_line(line, PALETTE.grid, LineLayer::Grid);
+            index += 1;
+        }
+
+        geometry.add_line(line, PALETTE.x_axis, LineLayer::Axis);
+        assert_eq!(geometry.line_count, MAX_WORLD_LINES);
+
+        let mut axes = 0;
+        let mut grids = 0;
+        index = 0;
+        while index < geometry.line_count {
+            match geometry.lines[index] {
+                Some(ColoredLine {
+                    layer: LineLayer::Axis,
+                    ..
+                }) => axes += 1,
+                Some(ColoredLine {
+                    layer: LineLayer::Grid,
+                    ..
+                }) => grids += 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        assert_eq!(axes, 1);
+        assert_eq!(grids, MAX_WORLD_LINES - 1);
     }
 
     #[test]
@@ -1286,7 +1899,8 @@ mod tests {
             &Camera::new().projector(),
             Domain::DEFAULT,
             domain_tick_size(Domain::DEFAULT),
-            &surface,
+            ProjectedSurface::Wireframe(&surface),
+            GraphOptions::DEFAULT,
         );
         let mut numeric = 0;
         let mut index = 0;
@@ -1328,8 +1942,15 @@ mod tests {
             }
             row += 1;
         }
-        let geometry =
-            build_world_geometry(&projector, Domain::DEFAULT, z_min, z_max, true, &projected);
+        let geometry = build_world_geometry(
+            &projector,
+            Domain::DEFAULT,
+            z_min,
+            z_max,
+            true,
+            ProjectedSurface::Wireframe(&projected),
+            GraphOptions::DEFAULT,
+        );
         let mut numeric = 0;
         let mut axes = 0;
         let mut index = 0;
@@ -1347,5 +1968,245 @@ mod tests {
         assert!(numeric >= 1);
         assert!(numeric <= MAX_NUMERIC_LABELS_PER_AXIS * 3);
         assert_eq!(axes, 3);
+    }
+
+    fn solid_vertex(x: i16, y: i16, inverse_depth: u16) -> SolidVertex {
+        SolidVertex {
+            screen: ScreenPoint { x, y },
+            inverse_depth,
+        }
+    }
+
+    #[test]
+    fn compact_solid_vertex_and_depth_encoding_are_bounded() {
+        assert_eq!(core::mem::size_of::<SolidVertex>(), 6);
+        assert_eq!(
+            core::mem::size_of::<[[ScreenPoint; COLUMNS]; ROWS]>(),
+            1_900
+        );
+        assert_eq!(
+            core::mem::size_of::<[[SolidVertex; COLUMNS]; ROWS]>(),
+            2_850
+        );
+        assert_eq!(
+            core::mem::size_of::<[Color; SCREEN_WIDTH * BAND_HEIGHT]>(),
+            5_120
+        );
+        assert_eq!(
+            core::mem::size_of::<[u16; SCREEN_WIDTH * BAND_HEIGHT]>(),
+            5_120
+        );
+        assert_eq!(core::mem::size_of::<TriangleShades>(), 864);
+        assert_eq!(encode_inverse_depth(1.0), 0);
+        let near = encode_inverse_depth(SOLID_NEAR_DEPTH);
+        let middle = encode_inverse_depth(8.0);
+        let far = encode_inverse_depth(20.0);
+        assert!(near > middle);
+        assert!(middle > far);
+        assert!(far > 0);
+        assert_eq!(encode_inverse_depth(f32::NAN), 0);
+        assert_eq!(encode_inverse_depth(f32::INFINITY), 0);
+    }
+
+    #[test]
+    fn triangle_depth_is_independent_of_traversal_order() {
+        let near = [
+            solid_vertex(20, 26, 50_000),
+            solid_vertex(60, 26, 50_000),
+            solid_vertex(20, 31, 50_000),
+        ];
+        let far = [
+            solid_vertex(20, 26, 10_000),
+            solid_vertex(60, 26, 10_000),
+            solid_vertex(20, 31, 10_000),
+        ];
+        let near_color = Color { rgb565: 0xf800 };
+        let far_color = Color { rgb565: 0x07e0 };
+        let mut first_pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut first_depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        draw_triangle_band(&mut first_pixels, &mut first_depth, 24, far, far_color);
+        draw_triangle_band(&mut first_pixels, &mut first_depth, 24, near, near_color);
+
+        let mut second_pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut second_depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        draw_triangle_band(&mut second_pixels, &mut second_depth, 24, near, near_color);
+        draw_triangle_band(&mut second_pixels, &mut second_depth, 24, far, far_color);
+
+        assert_eq!(first_depth, second_depth);
+        assert_eq!(first_pixels, second_pixels);
+        assert!(first_pixels.iter().any(|pixel| *pixel == near_color));
+        assert!(!first_pixels.iter().any(|pixel| *pixel == far_color));
+    }
+
+    #[test]
+    fn equal_depth_uses_a_stable_first_writer_tie_policy() {
+        let triangle = [
+            solid_vertex(20, 26, 25_000),
+            solid_vertex(60, 26, 25_000),
+            solid_vertex(20, 31, 25_000),
+        ];
+        let first_color = Color { rgb565: 0xf800 };
+        let second_color = Color { rgb565: 0x07e0 };
+        let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        draw_triangle_band(&mut pixels, &mut depth, 24, triangle, first_color);
+        let after_first = pixels;
+        draw_triangle_band(&mut pixels, &mut depth, 24, triangle, second_color);
+        assert_eq!(pixels, after_first);
+    }
+
+    #[test]
+    fn incremental_depth_changes_monotonically_across_a_triangle() {
+        let triangle = [
+            solid_vertex(20, 26, 50_000),
+            solid_vertex(100, 26, 10_000),
+            solid_vertex(20, 31, 50_000),
+        ];
+        let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        draw_triangle_band(
+            &mut pixels,
+            &mut depth,
+            24,
+            triangle,
+            Color { rgb565: 0x1234 },
+        );
+        let left = depth[(27 - 24) * SCREEN_WIDTH + 25];
+        let middle = depth[(27 - 24) * SCREEN_WIDTH + 45];
+        let right = depth[(27 - 24) * SCREEN_WIDTH + 65];
+        assert!(left > middle);
+        assert!(middle > right);
+        assert!(right > 0);
+    }
+
+    #[test]
+    fn triangle_band_clipping_and_invalid_rejection_are_safe() {
+        let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        let crossing = [
+            solid_vertex(-20, 20, 30_000),
+            solid_vertex(40, 27, 30_000),
+            solid_vertex(10, 40, 30_000),
+        ];
+        draw_triangle_band(
+            &mut pixels,
+            &mut depth,
+            24,
+            crossing,
+            Color { rgb565: 0x1234 },
+        );
+        assert!(depth.iter().any(|value| *value != 0));
+
+        let before = pixels;
+        let invalid = [SolidVertex::INVALID, crossing[1], crossing[2]];
+        draw_triangle_band(
+            &mut pixels,
+            &mut depth,
+            24,
+            invalid,
+            Color { rgb565: 0xffff },
+        );
+        assert_eq!(pixels, before);
+
+        let outside = [
+            solid_vertex(10, 5, 30_000),
+            solid_vertex(40, 5, 30_000),
+            solid_vertex(10, 10, 30_000),
+        ];
+        draw_triangle_band(
+            &mut pixels,
+            &mut depth,
+            24,
+            outside,
+            Color { rgb565: 0xffff },
+        );
+        assert_eq!(pixels, before);
+    }
+
+    #[test]
+    fn solid_grid_line_obeys_filled_depth() {
+        let mut hidden_pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let hidden_depth = [30_000_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        draw_depth_line(
+            &mut hidden_pixels,
+            &hidden_depth,
+            24,
+            solid_vertex(10, 27, 10_000),
+            solid_vertex(30, 27, 10_000),
+            PALETTE.solid_grid,
+        );
+        assert!(hidden_pixels
+            .iter()
+            .all(|pixel| *pixel == PALETTE.background));
+
+        let mut visible_pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        draw_depth_line(
+            &mut visible_pixels,
+            &hidden_depth,
+            24,
+            solid_vertex(10, 27, 40_000),
+            solid_vertex(30, 27, 40_000),
+            PALETTE.solid_grid,
+        );
+        assert!(visible_pixels
+            .iter()
+            .any(|pixel| *pixel == PALETTE.solid_grid));
+    }
+
+    #[test]
+    fn solid_grid_topology_visits_each_unique_edge_once() {
+        assert_eq!(SURFACE_GRID_EDGE_COUNT, 906);
+        assert_eq!(ROWS * (COLUMNS - 1), 456);
+        assert_eq!(COLUMNS * (ROWS - 1), 450);
+    }
+
+    #[test]
+    fn solid_grid_does_not_bridge_invalid_triangle_regions() {
+        let mut shades = [[[0_u8; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
+        assert!(!horizontal_surface_edge_is_valid(&shades, 1, 1));
+        assert!(!vertical_surface_edge_is_valid(&shades, 1, 1));
+
+        shades[1][1][0] = 100;
+        assert!(horizontal_surface_edge_is_valid(&shades, 1, 1));
+        shades[1][1][0] = 0;
+        shades[1][1][1] = 100;
+        assert!(vertical_surface_edge_is_valid(&shades, 1, 1));
+
+        assert!(!horizontal_surface_edge_is_valid(&shades, ROWS, 0));
+        assert!(!vertical_surface_edge_is_valid(&shades, 0, COLUMNS));
+    }
+
+    #[test]
+    fn rgb565_triangle_lighting_stays_within_the_base_channels() {
+        let darkest = shaded_surface_color(1).rgb565;
+        let brightest = shaded_surface_color(255).rgb565;
+        assert_eq!(brightest, PALETTE.solid_surface.rgb565);
+        assert_ne!(brightest, darkest);
+        assert!((darkest >> 11) <= (brightest >> 11));
+        assert!(((darkest >> 5) & 0x3f) <= ((brightest >> 5) & 0x3f));
+        assert!((darkest & 0x1f) <= (brightest & 0x1f));
+    }
+
+    #[test]
+    fn graph_options_remove_coordinate_geometry_without_touching_surface() {
+        let hidden = GraphOptions {
+            rendering_mode: RenderingMode::Wireframe,
+            show_grid: false,
+            show_axes: false,
+            show_ticks: false,
+            show_labels: false,
+        };
+        let geometry = build_world_geometry(
+            &Camera::new().projector(),
+            Domain::DEFAULT,
+            -1.0,
+            1.0,
+            true,
+            ProjectedSurface::Wireframe(&empty_surface()),
+            hidden,
+        );
+        assert_eq!(geometry.line_count, 0);
+        assert_eq!(geometry.label_count, 0);
+        assert_eq!(geometry.origin, None);
     }
 }

@@ -9,6 +9,12 @@
 use crate::eadk::{self, Color, Point, Rect};
 use crate::editor::{EquationEditor, VISIBLE_CHARACTERS};
 use crate::expression::ParseError;
+use crate::graph::{GraphOptions, RenderingMode};
+use crate::settings::{
+    DomainField, NumberText, NumericError, SettingsItem, SettingsPage, SettingsState,
+    NUMERIC_VISIBLE_CHARACTERS,
+};
+use crate::surface::{Domain, DomainError};
 
 /// Header height; the graph renderer owns the remaining 320×216 viewport.
 pub const HEADER_HEIGHT: u16 = 24;
@@ -32,7 +38,7 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v1.0.0\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.0.0\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
@@ -208,11 +214,24 @@ pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
     );
 }
 
-/// Draws the allocation-free Settings placeholder until settings are implemented.
-pub fn draw_settings_placeholder() {
+/// Draws the current allocation-free Settings page.
+///
+/// Main-menu selection and numeric drafts are state only; this function performs
+/// no mutation. As with Equation, firmware strings are safe here because the
+/// complete Settings content region is redrawn synchronously, never between graph
+/// band transfers.
+pub fn draw_settings(
+    settings: &SettingsState,
+    options: GraphOptions,
+    domain: Domain,
+    focused: bool,
+    graph_render_ms: Option<u32>,
+) {
     clear_content();
-    draw_centered_message(b"Settings\0", 79, 105);
-    draw_centered_message(b"Options coming later\0", 69, 128);
+    match settings.page() {
+        SettingsPage::Main => draw_settings_menu(settings, options, focused),
+        SettingsPage::Domain => draw_domain_settings(settings, domain, focused),
+    }
     eadk::display::draw_string(
         APPLICATION_DISPLAY_VERSION,
         Point {
@@ -223,6 +242,309 @@ pub fn draw_settings_placeholder() {
         DARK_GRAY,
         WHITE,
     );
+    if let Some(milliseconds) = graph_render_ms {
+        let mut text = [0_u8; 16];
+        let text = format_render_milliseconds(milliseconds, &mut text);
+        eadk::display::draw_string(
+            text,
+            Point {
+                x: 4,
+                y: VERSION_TEXT_Y,
+            },
+            false,
+            DARK_GRAY,
+            WHITE,
+        );
+    }
+}
+
+fn format_render_milliseconds(value: u32, buffer: &mut [u8; 16]) -> &[u8] {
+    let prefix = b"Last:";
+    let mut index = 0;
+    while index < prefix.len() {
+        buffer[index] = prefix[index];
+        index += 1;
+    }
+    let mut reverse = [0_u8; 10];
+    let mut count = 0;
+    let mut remaining = value;
+    loop {
+        reverse[count] = b'0' + (remaining % 10) as u8;
+        count += 1;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    while count > 0 && index + 3 < buffer.len() {
+        count -= 1;
+        buffer[index] = reverse[count];
+        index += 1;
+    }
+    buffer[index] = b'm';
+    buffer[index + 1] = b's';
+    buffer[index + 2] = 0;
+    &buffer[..index + 3]
+}
+
+const SETTINGS_ROW_TOP: u16 = 30;
+const SETTINGS_ROW_HEIGHT: u16 = 25;
+const SETTINGS_LABELS: [&[u8]; 7] = [
+    b"Rendering\0",
+    b"Ground grid\0",
+    b"Axes\0",
+    b"Ticks\0",
+    b"Labels\0",
+    b"Domain\0",
+    b"Reset camera\0",
+];
+
+fn draw_settings_menu(settings: &SettingsState, options: GraphOptions, focused: bool) {
+    let selected = settings.selected_item().index();
+    let mut row = 0;
+    while row < SETTINGS_LABELS.len() {
+        let top = SETTINGS_ROW_TOP + row as u16 * SETTINGS_ROW_HEIGHT;
+        let is_selected = row == selected;
+        let background = if is_selected { FIELD_BACKGROUND } else { WHITE };
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 8,
+                y: top,
+                width: 304,
+                height: SETTINGS_ROW_HEIGHT - 2,
+            },
+            background,
+        );
+        if is_selected {
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: 8,
+                    y: top,
+                    width: 3,
+                    height: SETTINGS_ROW_HEIGHT - 2,
+                },
+                if focused { ORANGE } else { DARK_GRAY },
+            );
+        }
+        eadk::display::draw_string(
+            SETTINGS_LABELS[row],
+            Point { x: 16, y: top + 2 },
+            false,
+            BLACK,
+            background,
+        );
+        let (value, x) = setting_value(SettingsItem::from_index(row), options);
+        eadk::display::draw_string(
+            value,
+            Point { x, y: top + 2 },
+            false,
+            if is_selected { BLUE } else { DARK_GRAY },
+            background,
+        );
+        row += 1;
+    }
+}
+
+fn setting_value(item: SettingsItem, options: GraphOptions) -> (&'static [u8], u16) {
+    match item {
+        SettingsItem::RenderingMode => match options.rendering_mode {
+            RenderingMode::Wireframe => (b"Wireframe\0", 228),
+            RenderingMode::Solid => (b"Solid\0", 270),
+            RenderingMode::SolidGrid => (b"Solid + grid\0", 221),
+        },
+        SettingsItem::GroundGrid => on_off(options.show_grid),
+        SettingsItem::Axes => on_off(options.show_axes),
+        SettingsItem::Ticks => on_off(options.show_ticks),
+        SettingsItem::Labels => on_off(options.show_labels),
+        SettingsItem::Domain => (b"EXE >\0", 270),
+        SettingsItem::ResetCamera => (b"EXE\0", 284),
+    }
+}
+
+fn on_off(value: bool) -> (&'static [u8], u16) {
+    if value {
+        (b"On\0", 291)
+    } else {
+        (b"Off\0", 284)
+    }
+}
+
+const DOMAIN_LABELS: [&[u8]; 4] = [b"Xmin\0", b"Xmax\0", b"Ymin\0", b"Ymax\0"];
+const DOMAIN_TITLE_Y: u16 = 31;
+const DOMAIN_ROW_TOP: u16 = 55;
+const DOMAIN_ROW_HEIGHT: u16 = 30;
+const DOMAIN_FIELD_X: u16 = 82;
+const DOMAIN_FIELD_WIDTH: u16 = 225;
+
+fn draw_domain_settings(settings: &SettingsState, domain: Domain, focused: bool) {
+    eadk::display::draw_string(
+        b"Graph domain\0",
+        Point {
+            x: 12,
+            y: DOMAIN_TITLE_Y,
+        },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    let selected = settings.selected_domain_field().index();
+    let mut row = 0;
+    while row < DOMAIN_LABELS.len() {
+        let top = DOMAIN_ROW_TOP + row as u16 * DOMAIN_ROW_HEIGHT;
+        let is_selected = row == selected;
+        eadk::display::draw_string(
+            DOMAIN_LABELS[row],
+            Point { x: 16, y: top + 3 },
+            false,
+            BLACK,
+            WHITE,
+        );
+        draw_domain_field(
+            settings,
+            DomainField::from_index(row),
+            domain,
+            top,
+            is_selected,
+            focused,
+        );
+        row += 1;
+    }
+
+    let message = match settings.error() {
+        Some(error) => numeric_error_message(error),
+        None if settings.is_editing() => b"EXE: apply   Back: cancel\0",
+        None => b"EXE: edit   Back: settings\0",
+    };
+    eadk::display::draw_string(
+        message,
+        Point { x: 12, y: 190 },
+        false,
+        if settings.error().is_some() {
+            Color { rgb565: 0xb800 }
+        } else {
+            DARK_GRAY
+        },
+        WHITE,
+    );
+}
+
+fn draw_domain_field(
+    settings: &SettingsState,
+    field: DomainField,
+    domain: Domain,
+    top: u16,
+    selected: bool,
+    focused: bool,
+) {
+    let editing = selected && settings.is_editing();
+    let background = if selected { FIELD_BACKGROUND } else { WHITE };
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: DOMAIN_FIELD_X,
+            y: top,
+            width: DOMAIN_FIELD_WIDTH,
+            height: 23,
+        },
+        background,
+    );
+    if selected {
+        let border = if focused { BLUE } else { DARK_GRAY };
+        draw_field_border(DOMAIN_FIELD_X, top, DOMAIN_FIELD_WIDTH, 23, border);
+    }
+
+    if editing {
+        let mut visible = [0_u8; NUMERIC_VISIBLE_CHARACTERS + 1];
+        let bytes = settings.edit_visible_bytes();
+        let mut index = 0;
+        while index < bytes.len() && index < NUMERIC_VISIBLE_CHARACTERS {
+            visible[index] = bytes[index];
+            index += 1;
+        }
+        eadk::display::draw_string(
+            &visible,
+            Point {
+                x: DOMAIN_FIELD_X + 5,
+                y: top + 3,
+            },
+            false,
+            BLACK,
+            background,
+        );
+        if focused {
+            let cursor_column = settings.edit_cursor() - settings.edit_scroll();
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: DOMAIN_FIELD_X + 5 + cursor_column as u16 * SMALL_FONT_CHARACTER_WIDTH,
+                    y: top + 19,
+                    width: 6,
+                    height: 2,
+                },
+                BLUE,
+            );
+        }
+    } else {
+        let text = NumberText::new(field.value(domain));
+        eadk::display::draw_string(
+            text.as_c_string(),
+            Point {
+                x: DOMAIN_FIELD_X + 5,
+                y: top + 3,
+            },
+            false,
+            BLACK,
+            background,
+        );
+    }
+}
+
+fn draw_field_border(x: u16, y: u16, width: u16, height: u16, color: Color) {
+    eadk::display::push_rect_uniform(
+        Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        },
+        color,
+    );
+    eadk::display::push_rect_uniform(
+        Rect {
+            x,
+            y,
+            width: 1,
+            height,
+        },
+        color,
+    );
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: x + width - 1,
+            y,
+            width: 1,
+            height,
+        },
+        color,
+    );
+    eadk::display::push_rect_uniform(
+        Rect {
+            x,
+            y: y + height - 1,
+            width,
+            height: 1,
+        },
+        color,
+    );
+}
+
+fn numeric_error_message(error: NumericError) -> &'static [u8] {
+    match error {
+        NumericError::InvalidNumber => b"Invalid number\0",
+        NumericError::TooLong => b"Number too long\0",
+        NumericError::Domain(DomainError::NonFinite) => b"Finite values only\0",
+        NumericError::Domain(DomainError::Inverted) => b"Minimum must be below maximum\0",
+        NumericError::Domain(DomainError::TooNarrow) => b"Domain is too narrow\0",
+        NumericError::Domain(DomainError::TooLarge) => b"Domain is too large\0",
+    }
 }
 
 fn clear_content() {
@@ -235,10 +557,6 @@ fn clear_content() {
         },
         WHITE,
     );
-}
-
-fn draw_centered_message(text: &[u8], x: u16, y: u16) {
-    eadk::display::draw_string(text, Point { x, y }, false, DARK_GRAY, WHITE);
 }
 
 fn error_message(error: ParseError) -> &'static [u8] {
@@ -254,5 +572,24 @@ fn error_message(error: ParseError) -> &'static [u8] {
         ParseError::EmptyExpression => b"Enter an expression\0",
         ParseError::InvalidNumber => b"Invalid number\0",
         ParseError::MissingOperand | ParseError::MissingOperator => b"Invalid expression\0",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn displayed_release_version_remains_manually_fixed() {
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.0.0\0");
+    }
+
+    #[test]
+    fn debug_render_time_is_bounded_and_c_terminated() {
+        let mut buffer = [0_u8; 16];
+        assert_eq!(format_render_milliseconds(37, &mut buffer), b"Last:37ms\0");
+        let text = format_render_milliseconds(u32::MAX, &mut buffer);
+        assert_eq!(text.last(), Some(&0));
+        assert!(text.len() <= buffer.len());
     }
 }

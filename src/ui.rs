@@ -29,6 +29,16 @@ const FIELD_BACKGROUND: Color = Color { rgb565: 0xffdf };
 const TAB_LABELS: [&[u8]; 3] = [b"Graph\0", b"Equation\0", b"Settings\0"];
 const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 
+// This user-facing version is intentionally maintained by hand. Do not derive,
+// synchronize, or update it from Cargo metadata, Git tags, or release tooling;
+// change it only when the project owner explicitly requests a displayed update.
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v1.0.0\0";
+const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
+const VERSION_TEXT_WIDTH: u16 =
+    (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
+const VERSION_TEXT_X: u16 = (SCREEN_WIDTH - VERSION_TEXT_WIDTH) / 2;
+const VERSION_TEXT_Y: u16 = 218;
+
 /// Draws all three tabs and the active/keyboard-focus indicator.
 pub fn draw_header(active: usize, selected: usize, tabs_focused: bool) {
     let mut index = 0;
@@ -203,6 +213,16 @@ pub fn draw_settings_placeholder() {
     clear_content();
     draw_centered_message(b"Settings\0", 79, 105);
     draw_centered_message(b"Options coming later\0", 69, 128);
+    eadk::display::draw_string(
+        APPLICATION_DISPLAY_VERSION,
+        Point {
+            x: VERSION_TEXT_X,
+            y: VERSION_TEXT_Y,
+        },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
 }
 
 fn clear_content() {

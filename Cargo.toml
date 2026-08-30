@@ -1,5 +1,5 @@
 [package]
 name = "numworks-3d-grapher"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Gabriel Bourneau"]
 edition = "2018"

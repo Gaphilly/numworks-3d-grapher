@@ -1,4 +1,6 @@
 use crate::eadk::{self, Color, Point, Rect};
+use crate::editor::{EquationEditor, VISIBLE_CHARACTERS};
+use crate::expression::ParseError;
 
 pub const HEADER_HEIGHT: u16 = 24;
 const SCREEN_WIDTH: u16 = 320;
@@ -13,6 +15,7 @@ const LIGHT_BLUE: Color = Color { rgb565: 0x9d7f };
 const LIGHT_GRAY: Color = Color { rgb565: 0xd69a };
 const DARK_GRAY: Color = Color { rgb565: 0x630c };
 const ORANGE: Color = Color { rgb565: 0xfd20 };
+const FIELD_BACKGROUND: Color = Color { rgb565: 0xffdf };
 
 const TAB_LABELS: [&[u8]; 3] = [b"Graph\0", b"Equation\0", b"Settings\0"];
 const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
@@ -64,10 +67,123 @@ pub fn draw_header(active: usize, selected: usize, tabs_focused: bool) {
     );
 }
 
-pub fn draw_equation_placeholder() {
+pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
     clear_content();
-    draw_centered_message(b"Equation\0", 82, 105);
-    draw_centered_message(b"Editor coming later\0", 73, 128);
+    eadk::display::draw_string(
+        b"Equation\0",
+        Point { x: 12, y: 38 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    eadk::display::draw_string(b"f(x,y) =\0", Point { x: 12, y: 61 }, false, BLACK, WHITE);
+
+    let border = if focused { BLUE } else { DARK_GRAY };
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: 10,
+            y: 82,
+            width: 300,
+            height: 20,
+        },
+        FIELD_BACKGROUND,
+    );
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: 9,
+            y: 81,
+            width: 302,
+            height: 1,
+        },
+        border,
+    );
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: 9,
+            y: 81,
+            width: 1,
+            height: 23,
+        },
+        border,
+    );
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: 310,
+            y: 81,
+            width: 1,
+            height: 23,
+        },
+        border,
+    );
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: 9,
+            y: 102,
+            width: 302,
+            height: 2,
+        },
+        border,
+    );
+
+    let mut visible = [0_u8; VISIBLE_CHARACTERS + 1];
+    let source = editor.visible_bytes();
+    let mut index = 0;
+    while index < source.len() && index < VISIBLE_CHARACTERS {
+        visible[index] = source[index];
+        index += 1;
+    }
+    eadk::display::draw_string(
+        &visible,
+        Point { x: 12, y: 85 },
+        false,
+        BLACK,
+        FIELD_BACKGROUND,
+    );
+
+    if focused {
+        let cursor_column = editor.cursor() - editor.scroll();
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 12 + cursor_column as u16 * 7,
+                y: 99,
+                width: 6,
+                height: 2,
+            },
+            BLUE,
+        );
+    }
+
+    if let Some(error) = editor.error() {
+        eadk::display::draw_string(
+            error_message(error),
+            Point { x: 12, y: 121 },
+            false,
+            Color { rgb565: 0xb800 },
+            WHITE,
+        );
+    } else {
+        eadk::display::draw_string(
+            b"EXE: graph   OK: tabs\0",
+            Point { x: 12, y: 121 },
+            false,
+            DARK_GRAY,
+            WHITE,
+        );
+    }
+    eadk::display::draw_string(
+        b"Back: cancel   Shift+BS: clear\0",
+        Point { x: 12, y: 145 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    eadk::display::draw_string(
+        b"Toolbox: abs()\0",
+        Point { x: 12, y: 169 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
 }
 
 pub fn draw_settings_placeholder() {
@@ -90,4 +206,20 @@ fn clear_content() {
 
 fn draw_centered_message(text: &[u8], x: u16, y: u16) {
     eadk::display::draw_string(text, Point { x, y }, false, DARK_GRAY, WHITE);
+}
+
+fn error_message(error: ParseError) -> &'static [u8] {
+    match error {
+        ParseError::InvalidCharacter => b"Invalid character\0",
+        ParseError::UnknownFunction => b"Unknown function\0",
+        ParseError::MissingClosingParenthesis => b"Missing ')'\0",
+        ParseError::MissingOpeningParenthesis => b"Missing '('\0",
+        ParseError::ExpressionTooLong => b"Expression too long\0",
+        ParseError::BytecodeTooLarge
+        | ParseError::OperatorStackOverflow
+        | ParseError::EvaluationStackOverflow => b"Expression too complex\0",
+        ParseError::EmptyExpression => b"Enter an expression\0",
+        ParseError::InvalidNumber => b"Invalid number\0",
+        ParseError::MissingOperand | ParseError::MissingOperator => b"Invalid expression\0",
+    }
 }

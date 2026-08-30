@@ -1,8 +1,12 @@
 use crate::camera::Camera;
 use crate::eadk::keyboard;
+use crate::editor::EditorAction;
+use crate::editor::EditorKeyRepeat;
+use crate::editor::EquationEditor;
+use crate::expression::CompiledExpression;
 use crate::input;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tab {
     Graph,
     Equation,
@@ -35,7 +39,7 @@ impl Tab {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Focus {
     Content,
     Tabs,
@@ -46,8 +50,10 @@ pub struct DirtyFlags {
     pub content: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub enum UpdateResult {
     Continue,
+    StateChanged,
     Exit,
 }
 
@@ -57,11 +63,14 @@ pub struct AppState {
     pub selected_tab: Tab,
     pub focus: Focus,
     pub dirty: DirtyFlags,
+    pub editor: EquationEditor,
+    editor_repeat: EditorKeyRepeat,
     previous_keys: keyboard::State,
+    pressed_keys: keyboard::State,
 }
 
 impl AppState {
-    pub const fn new() -> AppState {
+    pub fn new() -> AppState {
         AppState {
             camera: Camera::new(),
             active_tab: Tab::Graph,
@@ -71,12 +80,78 @@ impl AppState {
                 header: true,
                 content: true,
             },
+            editor: EquationEditor::new(),
+            editor_repeat: EditorKeyRepeat::new(),
             previous_keys: 0,
+            pressed_keys: 0,
+        }
+    }
+
+    pub fn pressed_keys(&self) -> keyboard::State {
+        self.pressed_keys
+    }
+
+    pub fn show_graph(&mut self) {
+        self.active_tab = Tab::Graph;
+        self.selected_tab = Tab::Graph;
+        self.focus = Focus::Content;
+        self.dirty.header = true;
+        self.dirty.content = true;
+    }
+
+    pub fn handle_editor_event(
+        &mut self,
+        event: crate::eadk::event::Event,
+        active_expression: &mut CompiledExpression,
+    ) -> UpdateResult {
+        match self.editor.handle_event(event) {
+            EditorAction::None => UpdateResult::Continue,
+            EditorAction::Changed => {
+                self.dirty.content = true;
+                UpdateResult::Continue
+            }
+            EditorAction::Submit => {
+                if self.editor.compile_into(active_expression) {
+                    self.show_graph();
+                    UpdateResult::StateChanged
+                } else {
+                    self.dirty.content = true;
+                    UpdateResult::Continue
+                }
+            }
+            EditorAction::Cancel => {
+                self.editor.dismiss_error();
+                self.show_graph();
+                UpdateResult::StateChanged
+            }
+            EditorAction::FocusTabs => {
+                self.selected_tab = self.active_tab;
+                self.focus = Focus::Tabs;
+                self.dirty.header = true;
+                self.dirty.content = true;
+                UpdateResult::StateChanged
+            }
+        }
+    }
+
+    pub fn update_editor_repeat(
+        &mut self,
+        keys: keyboard::State,
+        now_ms: u64,
+        active_expression: &mut CompiledExpression,
+    ) {
+        if self.active_tab != Tab::Equation || self.focus != Focus::Content {
+            self.editor_repeat.reset();
+            return;
+        }
+        if let Some(event) = self.editor_repeat.update(keys, now_ms) {
+            let _ = self.handle_editor_event(event, active_expression);
         }
     }
 
     pub fn update(&mut self, keys: keyboard::State) -> UpdateResult {
         let pressed = keys & !self.previous_keys;
+        self.pressed_keys = pressed;
         self.previous_keys = keys;
 
         if keyboard::key_down(pressed, keyboard::BACK) {
@@ -99,6 +174,8 @@ impl AppState {
                 }
                 self.focus = Focus::Content;
                 self.dirty.header = true;
+                self.dirty.content = true;
+                return UpdateResult::StateChanged;
             }
             return UpdateResult::Continue;
         }
@@ -107,7 +184,10 @@ impl AppState {
             self.selected_tab = self.active_tab;
             self.focus = Focus::Tabs;
             self.dirty.header = true;
-            return UpdateResult::Continue;
+            if self.active_tab == Tab::Equation {
+                self.dirty.content = true;
+            }
+            return UpdateResult::StateChanged;
         }
 
         if self.active_tab == Tab::Graph {
@@ -123,15 +203,121 @@ impl AppState {
             self.selected_tab = self.active_tab;
             self.focus = Focus::Content;
             self.dirty.header = true;
-            return UpdateResult::Continue;
+            if self.active_tab == Tab::Equation {
+                self.dirty.content = true;
+            }
+            return UpdateResult::StateChanged;
         }
         if self.active_tab != Tab::Graph {
             self.active_tab = Tab::Graph;
             self.selected_tab = Tab::Graph;
             self.dirty.header = true;
             self.dirty.content = true;
-            return UpdateResult::Continue;
+            return UpdateResult::StateChanged;
         }
         UpdateResult::Exit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eadk::event;
+    use crate::function::SurfaceFunction;
+
+    fn key(key: u8) -> keyboard::State {
+        1_u64 << key
+    }
+
+    fn release(app: &mut AppState) {
+        let _ = app.update(0);
+    }
+
+    fn enter_equation(app: &mut AppState) {
+        assert!(matches!(
+            app.update(key(keyboard::OK)),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.focus, Focus::Tabs);
+        release(app);
+
+        assert!(matches!(
+            app.update(key(keyboard::RIGHT)),
+            UpdateResult::Continue
+        ));
+        assert_eq!(app.selected_tab, Tab::Equation);
+        release(app);
+
+        assert!(matches!(
+            app.update(key(keyboard::OK)),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.active_tab, Tab::Equation);
+        assert_eq!(app.focus, Focus::Content);
+        release(app);
+    }
+
+    #[test]
+    fn graph_tabs_and_equation_focus_transitions() {
+        let mut app = AppState::new();
+        enter_equation(&mut app);
+
+        let before = app.editor.source().len();
+        let mut active = CompiledExpression::compile("x").expect("valid expression");
+        assert!(matches!(
+            app.handle_editor_event(event::ONE, &mut active),
+            UpdateResult::Continue
+        ));
+        assert_eq!(app.active_tab, Tab::Equation);
+        assert_eq!(app.focus, Focus::Content);
+        assert_eq!(app.editor.source().len(), before + 1);
+
+        assert!(matches!(
+            app.update(key(keyboard::OK)),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.focus, Focus::Tabs);
+    }
+
+    #[test]
+    fn exe_compiles_and_returns_to_graph() {
+        let mut app = AppState::new();
+        enter_equation(&mut app);
+        let mut active = CompiledExpression::compile("x").expect("valid expression");
+
+        assert!(matches!(
+            app.handle_editor_event(event::EXE, &mut active),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.active_tab, Tab::Graph);
+        assert_eq!(app.focus, Focus::Content);
+        let expected = CompiledExpression::compile("sin(x) * cos(y)")
+            .expect("valid expression")
+            .evaluate(0.5, 0.25);
+        assert!((active.evaluate(0.5, 0.25) - expected).abs() < 0.0001);
+    }
+
+    #[test]
+    fn equation_back_preserves_active_expression() {
+        let mut app = AppState::new();
+        enter_equation(&mut app);
+        let active = CompiledExpression::compile("x+y").expect("valid expression");
+        let before = active.evaluate(2.0, 3.0);
+
+        assert!(matches!(
+            app.update(key(keyboard::BACK)),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.active_tab, Tab::Graph);
+        assert_eq!(active.evaluate(2.0, 3.0), before);
+    }
+
+    #[test]
+    fn graph_back_exits() {
+        let mut app = AppState::new();
+        assert!(matches!(
+            app.update(key(keyboard::BACK)),
+            UpdateResult::Exit
+        ));
     }
 }

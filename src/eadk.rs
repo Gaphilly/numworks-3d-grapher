@@ -109,6 +109,9 @@ pub mod keyboard {
     pub const RIGHT: u8 = 3;
     pub const OK: u8 = 4;
     pub const BACK: u8 = 5;
+    pub const SHIFT: u8 = 12;
+    pub const ALPHA: u8 = 13;
+    pub const BACKSPACE: u8 = 17;
     pub const PLUS: u8 = 45;
     pub const MINUS: u8 = 46;
 
@@ -122,6 +125,127 @@ pub mod keyboard {
 
     extern "C" {
         fn eadk_keyboard_scan() -> State;
+    }
+}
+
+pub mod event {
+    pub type Event = u16;
+
+    pub const LEFT: Event = 0;
+    pub const RIGHT: Event = 3;
+    pub const OK: Event = 4;
+    pub const BACK: Event = 5;
+    pub const SHIFT: Event = 12;
+    pub const ALPHA: Event = 13;
+    pub const XNT: Event = 14;
+    pub const TOOLBOX: Event = 16;
+    pub const BACKSPACE: Event = 17;
+    pub const COMMA: Event = 22;
+    pub const POWER: Event = 23;
+    pub const SINE: Event = 24;
+    pub const COSINE: Event = 25;
+    pub const TANGENT: Event = 26;
+    pub const SQRT: Event = 28;
+    pub const SQUARE: Event = 29;
+    pub const SEVEN: Event = 30;
+    pub const EIGHT: Event = 31;
+    pub const NINE: Event = 32;
+    pub const LEFT_PARENTHESIS: Event = 33;
+    pub const RIGHT_PARENTHESIS: Event = 34;
+    pub const FOUR: Event = 36;
+    pub const FIVE: Event = 37;
+    pub const SIX: Event = 38;
+    pub const MULTIPLICATION: Event = 39;
+    pub const DIVISION: Event = 40;
+    pub const ONE: Event = 42;
+    pub const TWO: Event = 43;
+    pub const THREE: Event = 44;
+    pub const PLUS: Event = 45;
+    pub const MINUS: Event = 46;
+    pub const ZERO: Event = 48;
+    pub const DOT: Event = 49;
+    pub const EE: Event = 50;
+    pub const EXE: Event = 52;
+    pub const SHIFT_LEFT: Event = 54;
+    pub const SHIFT_RIGHT: Event = 57;
+    pub const CLEAR: Event = 71;
+    pub const SPACE: Event = 154;
+    const NONE: Event = 216;
+    const IDLE: Event = 223;
+
+    pub fn poll() -> Option<Event> {
+        // Epsilon's event implementation requires a timeout greater than
+        // its 200 ms initial repeat delay. Calls are made only after a raw
+        // key-down edge, so a queued event normally returns immediately.
+        let mut timeout = 250_i32;
+        let value = unsafe { eadk_event_get(&mut timeout) };
+        if value == NONE || value == IDLE {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    pub fn lowercase_letter(value: Event) -> Option<u8> {
+        match value {
+            126 => Some(b'a'),
+            127 => Some(b'b'),
+            128 => Some(b'c'),
+            129 => Some(b'd'),
+            130 => Some(b'e'),
+            131 => Some(b'f'),
+            132 => Some(b'g'),
+            133 => Some(b'h'),
+            134 => Some(b'i'),
+            135 => Some(b'j'),
+            136 => Some(b'k'),
+            137 => Some(b'l'),
+            138 => Some(b'm'),
+            139 => Some(b'n'),
+            140 => Some(b'o'),
+            141 => Some(b'p'),
+            142 => Some(b'q'),
+            144 => Some(b'r'),
+            145 => Some(b's'),
+            146 => Some(b't'),
+            147 => Some(b'u'),
+            148 => Some(b'v'),
+            150 => Some(b'w'),
+            151 => Some(b'x'),
+            152 => Some(b'y'),
+            153 => Some(b'z'),
+            180 => Some(b'a'),
+            181 => Some(b'b'),
+            182 => Some(b'c'),
+            183 => Some(b'd'),
+            184 => Some(b'e'),
+            185 => Some(b'f'),
+            186 => Some(b'g'),
+            187 => Some(b'h'),
+            188 => Some(b'i'),
+            189 => Some(b'j'),
+            190 => Some(b'k'),
+            191 => Some(b'l'),
+            192 => Some(b'm'),
+            193 => Some(b'n'),
+            194 => Some(b'o'),
+            195 => Some(b'p'),
+            196 => Some(b'q'),
+            198 => Some(b'r'),
+            199 => Some(b's'),
+            200 => Some(b't'),
+            201 => Some(b'u'),
+            202 => Some(b'v'),
+            204 => Some(b'w'),
+            205 => Some(b'x'),
+            206 => Some(b'y'),
+            207 => Some(b'z'),
+            _ => None,
+        }
+    }
+
+    extern "C" {
+        fn eadk_event_get(timeout: *mut i32) -> Event;
     }
 }
 

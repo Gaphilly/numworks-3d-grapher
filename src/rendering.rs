@@ -15,7 +15,7 @@
 //! hardware flashing bug.
 
 use crate::camera::{Camera, ProjectedLine, ProjectedPoint, Projector, ScreenPoint};
-use crate::eadk::{self, Color, Rect};
+use crate::eadk::{self, Color, Point, Rect};
 use crate::graph::{self, AxisVisibility, GraphOptions, RenderingMode, TickGenerator, PALETTE};
 use crate::surface::{
     Domain, Point3, SurfaceGrid, TriangleShades, COLUMNS, ROWS, TRIANGLES_PER_CELL,
@@ -38,6 +38,7 @@ const MIN_NUMERIC_SURFACE_DISTANCE_SQUARED: i32 = 9;
 const MIN_AXIS_SURFACE_DISTANCE_SQUARED: i32 = 4;
 const SOLID_NEAR_DEPTH: f32 = 1.05;
 const DEPTH_KEY_MAX: f32 = u16::MAX as f32;
+#[cfg(test)]
 const SURFACE_GRID_DEPTH_TOLERANCE: u16 = 24;
 #[cfg(test)]
 const SURFACE_GRID_EDGE_COUNT: usize = ROWS * (COLUMNS - 1) + COLUMNS * (ROWS - 1);
@@ -92,6 +93,27 @@ const AXIS_Y_GLYPH: [u8; 7] = [
 const AXIS_Z_GLYPH: [u8; 7] = [
     0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
 ];
+
+// Solid shading is computed once per triangle, but the same shade is consumed
+// once for every band that triangle can touch. Keeping the exact RGB565 result
+// in flash avoids repeating three channel multiplications/divisions in the
+// 27-band loop without adding RAM or changing the lighting appearance.
+const SHADE_COLOR_LUT: [u16; 256] = build_shade_color_lut();
+
+const fn build_shade_color_lut() -> [u16; 256] {
+    let red = ((PALETTE.solid_surface.rgb565 >> 11) & 0x1f) as u32;
+    let green = ((PALETTE.solid_surface.rgb565 >> 5) & 0x3f) as u32;
+    let blue = (PALETTE.solid_surface.rgb565 & 0x1f) as u32;
+    let mut colors = [0_u16; 256];
+    let mut shade = 0_u32;
+    while shade < colors.len() as u32 {
+        colors[shade as usize] = ((red * shade / 255) as u16) << 11
+            | ((green * shade / 255) as u16) << 5
+            | (blue * shade / 255) as u16;
+        shade += 1;
+    }
+    colors
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum LineLayer {
@@ -299,12 +321,16 @@ impl WorldGeometry {
 /// surface-dirty path in `main`, not this projection/rasterization function.
 /// Wireframe and solid paths are separate so wireframe never pays the solid
 /// mode's 5,120-byte depth-band stack cost.
-pub fn render(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options: GraphOptions) {
+pub fn render(
+    camera: &Camera,
+    domain: Domain,
+    surface: &SurfaceGrid,
+    options: GraphOptions,
+    diagnostics_enabled: bool,
+) {
     match options.rendering_mode {
         RenderingMode::Wireframe => render_wireframe(camera, domain, surface, options),
-        RenderingMode::Solid | RenderingMode::SolidGrid => {
-            render_solid(camera, domain, surface, options)
-        }
+        RenderingMode::Solid => render_solid(camera, domain, surface, options, diagnostics_enabled),
     }
 }
 
@@ -368,7 +394,14 @@ fn render_wireframe(camera: &Camera, domain: Domain, surface: &SurfaceGrid, opti
 }
 
 #[inline(never)]
-fn render_solid(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options: GraphOptions) {
+fn render_solid(
+    camera: &Camera,
+    domain: Domain,
+    surface: &SurfaceGrid,
+    options: GraphOptions,
+    diagnostics_enabled: bool,
+) {
+    diagnostic_marker(diagnostics_enabled, b"P00\0");
     // Lighting is solid-only transient state. Keeping it in this separate call
     // path prevents both its calculation and its 864-byte stack allocation from
     // affecting the established wireframe renderer.
@@ -419,6 +452,7 @@ fn render_solid(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options:
         draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Axis);
         draw_label_backgrounds(&mut pixels, band_y, &geometry);
         draw_labels(&mut pixels, band_y, &geometry, true);
+        diagnostic_marker_band(diagnostics_enabled, b'F', band_y);
         draw_solid_surface(
             &mut pixels,
             &mut depth,
@@ -426,13 +460,11 @@ fn render_solid(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options:
             &projected,
             &triangle_shades,
         );
-        if options.rendering_mode == RenderingMode::SolidGrid {
-            draw_depth_surface_grid(&mut pixels, &depth, band_y, &projected, &triangle_shades);
-        }
         draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
         draw_origin(&mut pixels, band_y, geometry.origin);
         draw_labels(&mut pixels, band_y, &geometry, false);
 
+        diagnostic_marker_band(diagnostics_enabled, b'D', band_y);
         eadk::display::push_rect(
             Rect {
                 x: 0,
@@ -444,6 +476,33 @@ fn render_solid(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options:
         );
         band_y += BAND_HEIGHT;
     }
+    diagnostic_marker(diagnostics_enabled, b"OK\0");
+}
+
+// EADK offers neither a serial console nor persistent crash logs. The tiny
+// marker survives a renderer stall long enough to identify the active phase:
+// P=setup/projection, F=solid fill, D=band transfer.
+// Its two digits are the current band (00..26). It only touches Graph's spare
+// header space while diagnostic mode is enabled.
+fn diagnostic_marker(enabled: bool, text: &[u8]) {
+    if enabled {
+        eadk::display::draw_string(
+            text,
+            Point { x: 286, y: 4 },
+            false,
+            Color { rgb565: 0xffff },
+            Color { rgb565: 0x245f },
+        );
+    }
+}
+
+fn diagnostic_marker_band(enabled: bool, phase: u8, band_y: usize) {
+    if !enabled {
+        return;
+    }
+    let band = (band_y - GRAPH_TOP) / BAND_HEIGHT;
+    let text = [phase, b'0' + (band / 10) as u8, b'0' + (band % 10) as u8, 0];
+    diagnostic_marker(true, &text);
 }
 
 fn build_world_geometry(
@@ -969,36 +1028,62 @@ fn draw_solid_surface(
         while column + 1 < COLUMNS {
             let shade = triangle_shades[row][column][0];
             if shade != 0 {
-                draw_triangle_band(
-                    pixels,
-                    depth,
-                    band_y,
-                    [
-                        projected[row][column],
-                        projected[row][column + 1],
-                        projected[row + 1][column + 1],
-                    ],
-                    shaded_surface_color(shade),
-                );
+                let first = projected[row][column];
+                let second = projected[row][column + 1];
+                let third = projected[row + 1][column + 1];
+                if triangle_intersects_band(first, second, third, band_y) {
+                    draw_triangle_band(
+                        pixels,
+                        depth,
+                        band_y,
+                        [first, second, third],
+                        shaded_surface_color(shade),
+                    );
+                }
             }
             let shade = triangle_shades[row][column][1];
             if shade != 0 {
-                draw_triangle_band(
-                    pixels,
-                    depth,
-                    band_y,
-                    [
-                        projected[row][column],
-                        projected[row + 1][column + 1],
-                        projected[row + 1][column],
-                    ],
-                    shaded_surface_color(shade),
-                );
+                let first = projected[row][column];
+                let second = projected[row + 1][column + 1];
+                let third = projected[row + 1][column];
+                if triangle_intersects_band(first, second, third, band_y) {
+                    draw_triangle_band(
+                        pixels,
+                        depth,
+                        band_y,
+                        [first, second, third],
+                        shaded_surface_color(shade),
+                    );
+                }
             }
             column += 1;
         }
         row += 1;
     }
+}
+
+/// Rejects a triangle before color conversion or raster setup when its projected
+/// Y extent cannot touch the active physical display band. It intentionally
+/// does not decide visibility: the rasterizer retains that validation so direct
+/// callers and invalid-projection handling keep their existing behavior.
+#[inline]
+fn triangle_intersects_band(
+    first: SolidVertex,
+    second: SolidVertex,
+    third: SolidVertex,
+    band_y: usize,
+) -> bool {
+    let minimum_y = minimum3(
+        first.screen.y as i32,
+        second.screen.y as i32,
+        third.screen.y as i32,
+    );
+    let maximum_y = maximum3(
+        first.screen.y as i32,
+        second.screen.y as i32,
+        third.screen.y as i32,
+    );
+    maximum_y >= band_y as i32 && minimum_y < (band_y + BAND_HEIGHT) as i32
 }
 
 /// Fills one projected triangle only inside the active eight-row band.
@@ -1020,6 +1105,10 @@ fn draw_triangle_band(
         || !vertices[1].is_visible()
         || !vertices[2].is_visible()
     {
+        return;
+    }
+
+    if !triangle_intersects_band(vertices[0], vertices[1], vertices[2], band_y) {
         return;
     }
 
@@ -1108,6 +1197,9 @@ fn draw_triangle_band(
                     let key = interpolated_depth.min(DEPTH_KEY_MAX) as u16;
                     let local_y = y as usize - band_y;
                     let index = local_y * SCREEN_WIDTH + x as usize;
+                    // Keep the guard at the FFI-facing rendering boundary. It
+                    // costs little compared with a pixel write and prevents a
+                    // malformed projection from panicking the calculator.
                     if index < depth.len() && key > depth[index] {
                         depth[index] = key;
                         pixels[index] = color;
@@ -1128,6 +1220,7 @@ fn draw_triangle_band(
     }
 }
 
+#[cfg(test)]
 fn draw_depth_surface_grid(
     pixels: &mut [Color],
     depth: &[u16],
@@ -1139,7 +1232,12 @@ fn draw_depth_surface_grid(
     while row < ROWS {
         let mut column = 0;
         while column < COLUMNS {
-            if column + 1 < COLUMNS
+            // The overlay is intentionally sparse: retain the outer boundary
+            // and every second interior row/column to bound camera-motion work.
+            let horizontal_overlay = row == 0 || row + 1 == ROWS || row % 2 == 0;
+            let vertical_overlay = column == 0 || column + 1 == COLUMNS || column % 2 == 0;
+            if horizontal_overlay
+                && column + 1 < COLUMNS
                 && horizontal_surface_edge_is_valid(triangle_shades, row, column)
             {
                 draw_depth_line(
@@ -1148,17 +1246,20 @@ fn draw_depth_surface_grid(
                     band_y,
                     projected[row][column],
                     projected[row][column + 1],
-                    PALETTE.solid_grid,
+                    PALETTE.grid,
                 );
             }
-            if row + 1 < ROWS && vertical_surface_edge_is_valid(triangle_shades, row, column) {
+            if vertical_overlay
+                && row + 1 < ROWS
+                && vertical_surface_edge_is_valid(triangle_shades, row, column)
+            {
                 draw_depth_line(
                     pixels,
                     depth,
                     band_y,
                     projected[row][column],
                     projected[row + 1][column],
-                    PALETTE.solid_grid,
+                    PALETTE.grid,
                 );
             }
             column += 1;
@@ -1167,6 +1268,7 @@ fn draw_depth_surface_grid(
     }
 }
 
+#[cfg(test)]
 fn horizontal_surface_edge_is_valid(
     triangle_shades: &TriangleShades,
     row: usize,
@@ -1179,6 +1281,7 @@ fn horizontal_surface_edge_is_valid(
         || (row > 0 && triangle_shades[row - 1][column][1] != 0)
 }
 
+#[cfg(test)]
 fn vertical_surface_edge_is_valid(
     triangle_shades: &TriangleShades,
     row: usize,
@@ -1194,7 +1297,200 @@ fn vertical_surface_edge_is_valid(
 /// Draws only portions of a surface edge whose reciprocal depth matches the
 /// visible fill. Back-facing grid edges therefore do not show through solid
 /// triangles and turn the result back into an opaque wireframe.
+#[cfg(test)]
 fn draw_depth_line(
+    pixels: &mut [Color],
+    depth: &[u16],
+    band_y: usize,
+    start: SolidVertex,
+    end: SolidVertex,
+    color: Color,
+) {
+    if !start.is_visible() || !end.is_visible() {
+        return;
+    }
+    let band_bottom = band_y as i32 + BAND_HEIGHT as i32 - 1;
+    let min_y = (start.screen.y.min(end.screen.y)) as i32;
+    let max_y = (start.screen.y.max(end.screen.y)) as i32;
+    if max_y < band_y as i32 || min_y > band_bottom {
+        return;
+    }
+
+    let x0 = start.screen.x as i32;
+    let y0 = start.screen.y as i32;
+    let x1 = end.screen.x as i32;
+    let y1 = end.screen.y as i32;
+    let dx = (x1 - x0).abs();
+    let dy_absolute = (y1 - y0).abs();
+    let steps = dx.max(dy_absolute) as u32;
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -dy_absolute;
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let (first_step, last_step) =
+        match depth_line_band_steps(y0, y1, dx, dy_absolute, band_y as i32, band_bottom) {
+            Some(steps) => steps,
+            None => return,
+        };
+    let (mut x0, mut y0, mut error) =
+        depth_line_state_at_step(x0, y0, x1, y1, dx, dy_absolute, first_step);
+    let mut step = first_step;
+    loop {
+        if x0 >= 0 && x0 < SCREEN_WIDTH as i32 && y0 >= band_y as i32 && y0 <= band_bottom {
+            let key = if steps == 0 {
+                start.inverse_depth
+            } else {
+                let start_weight = steps - step.min(steps);
+                let end_weight = step.min(steps);
+                ((start.inverse_depth as u32 * start_weight
+                    + end.inverse_depth as u32 * end_weight)
+                    / steps) as u16
+            };
+            let local_y = y0 as usize - band_y;
+            let index = local_y * SCREEN_WIDTH + x0 as usize;
+            if index < pixels.len()
+                && index < depth.len()
+                && key.saturating_add(SURFACE_GRID_DEPTH_TOLERANCE) >= depth[index]
+            {
+                pixels[index] = color;
+            }
+        }
+        // Renderer-produced endpoints are tightly bounded, but retain a hard
+        // stop for unexpected direct callers so a corrupt line can never hang
+        // the application or watchdog.
+        if step >= steps {
+            break;
+        }
+        if step == last_step {
+            break;
+        }
+        let twice_error = 2 * error;
+        if twice_error >= dy {
+            error += dy;
+            x0 += sx;
+        }
+        if twice_error <= dx {
+            error += dx;
+            y0 += sy;
+        }
+        step = step.saturating_add(1);
+    }
+}
+
+/// Determines the inclusive range of the original Bresenham step sequence
+/// whose Y coordinate belongs to this band. The surface projector bounds
+/// screen coordinates to roughly ±800, so the small integer products below
+/// remain safely in `i32`. Out-of-contract direct callers retain the original
+/// full traversal through the conservative fallback.
+#[cfg(test)]
+fn depth_line_band_steps(
+    y0: i32,
+    y1: i32,
+    dx: i32,
+    dy_absolute: i32,
+    band_top: i32,
+    band_bottom: i32,
+) -> Option<(u32, u32)> {
+    let steps = dx.max(dy_absolute);
+    if steps == 0 {
+        return if y0 >= band_top && y0 <= band_bottom {
+            Some((0, 0))
+        } else {
+            None
+        };
+    }
+    // `ScreenPoint` is public for tests, but renderer-produced points are
+    // bounded by Projector::project_transformed. Avoid overflow if a direct
+    // caller supplies arbitrary i16 endpoints.
+    if dx > 2_048 || dy_absolute > 2_048 {
+        return Some((0, steps as u32));
+    }
+    if dy_absolute == 0 {
+        return if y0 >= band_top && y0 <= band_bottom {
+            Some((0, steps as u32))
+        } else {
+            None
+        };
+    }
+
+    let downward = y1 >= y0;
+    let lower_progress = if downward {
+        (band_top - y0).max(0)
+    } else {
+        (y0 - band_bottom).max(0)
+    };
+    let upper_progress = if downward {
+        (band_bottom - y0).min(dy_absolute)
+    } else {
+        (y0 - band_top).min(dy_absolute)
+    };
+    if lower_progress > upper_progress || upper_progress < 0 {
+        return None;
+    }
+    let lower_progress = lower_progress.min(dy_absolute);
+    let upper_progress = upper_progress.max(0).min(dy_absolute);
+
+    if dy_absolute > dx {
+        return Some((lower_progress as u32, upper_progress as u32));
+    }
+
+    // For X-major Bresenham lines, Y has advanced by
+    // floor((dy * step + dx / 2) / dx). Inverting that exact expression gives
+    // the first/last global steps for this band without replaying the complete
+    // line from its endpoint for every band it crosses.
+    let first_numerator = lower_progress * dx - dx / 2;
+    let first_step = if first_numerator <= 0 {
+        0
+    } else {
+        (first_numerator + dy_absolute - 1) / dy_absolute
+    };
+    let last_numerator = (upper_progress + 1) * dx - dx / 2 - 1;
+    let last_step = last_numerator / dy_absolute;
+    let first_step = first_step.max(0).min(steps);
+    let last_step = last_step.max(0).min(steps);
+    if first_step > last_step {
+        None
+    } else {
+        Some((first_step as u32, last_step as u32))
+    }
+}
+
+/// Reconstructs the exact Bresenham point and error state after `step` global
+/// steps. Continuing the ordinary loop from this state preserves both pixel
+/// coverage and the existing global-step depth interpolation.
+#[cfg(test)]
+fn depth_line_state_at_step(
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    dx: i32,
+    dy_absolute: i32,
+    step: u32,
+) -> (i32, i32, i32) {
+    let step = step as i32;
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    if dx >= dy_absolute {
+        let vertical_steps = (dy_absolute * step + dx / 2) / dx;
+        (
+            x0 + sx * step,
+            y0 + sy * vertical_steps,
+            dx - dy_absolute - step * dy_absolute + vertical_steps * dx,
+        )
+    } else {
+        let horizontal_steps = (dx * step + dy_absolute / 2) / dy_absolute;
+        (
+            x0 + sx * horizontal_steps,
+            y0 + sy * step,
+            dx - dy_absolute + step * dx - horizontal_steps * dy_absolute,
+        )
+    }
+}
+
+#[cfg(test)]
+/// Original whole-line band walk retained only as a regression oracle. The
+/// optimized traversal must produce the same pixels for every individual band.
+fn draw_depth_line_reference(
     pixels: &mut [Color],
     depth: &[u16],
     band_y: usize,
@@ -1296,6 +1592,13 @@ fn encode_inverse_depth(depth: f32) -> u16 {
 }
 
 fn shaded_surface_color(shade: u8) -> Color {
+    Color {
+        rgb565: SHADE_COLOR_LUT[shade as usize],
+    }
+}
+
+#[cfg(test)]
+fn shaded_surface_color_reference(shade: u8) -> Color {
     let red = ((PALETTE.solid_surface.rgb565 >> 11) & 0x1f) as u32;
     let green = ((PALETTE.solid_surface.rgb565 >> 5) & 0x3f) as u32;
     let blue = (PALETTE.solid_surface.rgb565 & 0x1f) as u32;
@@ -2133,7 +2436,7 @@ mod tests {
             24,
             solid_vertex(10, 27, 10_000),
             solid_vertex(30, 27, 10_000),
-            PALETTE.solid_grid,
+            PALETTE.grid,
         );
         assert!(hidden_pixels
             .iter()
@@ -2146,11 +2449,57 @@ mod tests {
             24,
             solid_vertex(10, 27, 40_000),
             solid_vertex(30, 27, 40_000),
-            PALETTE.solid_grid,
+            PALETTE.grid,
         );
-        assert!(visible_pixels
-            .iter()
-            .any(|pixel| *pixel == PALETTE.solid_grid));
+        assert!(visible_pixels.iter().any(|pixel| *pixel == PALETTE.grid));
+    }
+
+    fn assert_depth_line_matches_reference(start: SolidVertex, end: SolidVertex, fill_depth: u16) {
+        let mut band_y = GRAPH_TOP;
+        while band_y < SCREEN_HEIGHT {
+            let mut optimized = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+            let mut reference = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+            let depth = [fill_depth; SCREEN_WIDTH * BAND_HEIGHT];
+            draw_depth_line(&mut optimized, &depth, band_y, start, end, PALETTE.grid);
+            draw_depth_line_reference(&mut reference, &depth, band_y, start, end, PALETTE.grid);
+            assert_eq!(optimized, reference, "band {band_y}");
+            band_y += BAND_HEIGHT;
+        }
+    }
+
+    #[test]
+    fn clipped_depth_grid_lines_match_the_original_bresenham_path() {
+        // Exercise both major-axis cases, both directions, band boundaries,
+        // and positive/negative reciprocal-depth gradients. Every optimized
+        // band must match the old complete-line traversal exactly.
+        let cases = [
+            (solid_vertex(8, 24, 12_000), solid_vertex(300, 40, 58_000)),
+            (solid_vertex(300, 40, 58_000), solid_vertex(8, 24, 12_000)),
+            (solid_vertex(160, 24, 50_000), solid_vertex(180, 238, 8_000)),
+            (solid_vertex(180, 238, 8_000), solid_vertex(160, 24, 50_000)),
+            (solid_vertex(10, 31, 24_000), solid_vertex(310, 31, 40_000)),
+            (
+                solid_vertex(111, 24, 40_000),
+                solid_vertex(111, 239, 24_000),
+            ),
+            (solid_vertex(-20, 20, 60_000), solid_vertex(340, 220, 8_000)),
+        ];
+        for (start, end) in cases {
+            assert_depth_line_matches_reference(start, end, 0);
+            // A nonzero completed-fill depth exercises both visible and hidden
+            // portions under the unchanged overlay tolerance policy.
+            assert_depth_line_matches_reference(start, end, 30_000);
+        }
+    }
+
+    #[test]
+    fn triangle_band_overlap_rejects_only_nonintersecting_bands() {
+        let first = solid_vertex(10, 31, 20_000);
+        let second = solid_vertex(50, 34, 20_000);
+        let third = solid_vertex(20, 39, 20_000);
+        assert!(triangle_intersects_band(first, second, third, 24));
+        assert!(triangle_intersects_band(first, second, third, 32));
+        assert!(!triangle_intersects_band(first, second, third, 40));
     }
 
     #[test]
@@ -2188,6 +2537,23 @@ mod tests {
     }
 
     #[test]
+    fn shade_lookup_is_exactly_the_previous_rgb565_calculation() {
+        let mut shade = 0_u16;
+        while shade <= u8::MAX as u16 {
+            let shade_u8 = shade as u8;
+            assert_eq!(
+                shaded_surface_color(shade_u8),
+                shaded_surface_color_reference(shade_u8),
+                "shade {shade_u8}"
+            );
+            if shade_u8 == u8::MAX {
+                break;
+            }
+            shade += 1;
+        }
+    }
+
+    #[test]
     fn graph_options_remove_coordinate_geometry_without_touching_surface() {
         let hidden = GraphOptions {
             rendering_mode: RenderingMode::Wireframe,
@@ -2195,6 +2561,7 @@ mod tests {
             show_axes: false,
             show_ticks: false,
             show_labels: false,
+            show_performance: false,
         };
         let geometry = build_world_geometry(
             &Camera::new().projector(),

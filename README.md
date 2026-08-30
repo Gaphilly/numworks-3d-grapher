@@ -6,10 +6,10 @@ The project targets `thumbv7em-none-eabihf` (the calculator's Cortex-M7-class Th
 
 ## Current features
 
-- Three surface modes: **Wireframe**, **Solid**, and **Solid + Grid**
+- Two surface modes: **Wireframe** and **Solid**
 - The original 25×19 wireframe renderer remains the startup default and UX/performance baseline
 - Ambient plus fixed-world-light Lambert shading for 864 regular height-field triangles
-- Band-local depth testing for filled triangles; Solid + Grid reuses the solid projection, fill, and depth results
+- Band-local depth testing for filled triangles
 - Configurable ground grid, axes, ticks, coordinate labels, rectangular XY domain, and camera reset
 - `f32` expression compiler/evaluator supporting constants, `x`, `y`, arithmetic, power, parentheses, unary minus, and `sin`, `cos`, `tan`, `sqrt`, and `abs`
 - Calculator-style Equation editor with a 96-byte buffer, cursor, scrolling, shortcuts, errors, and held-key repeat
@@ -27,9 +27,8 @@ Settings are retained only for the current application session; there is no pers
 | --- | --- |
 | Wireframe | The established low-cost row/column mesh. It has its own render path and does not allocate or calculate solid-only depth or lighting state. |
 | Solid | Two directly traversed triangles per regular-grid cell, filled with one ambient-plus-Lambert shade per triangle and ordered by a band-local depth buffer. |
-| Solid + Grid | The Solid result plus a depth-tested surface-grid overlay. It reuses the same samples, projection, triangle fill, and depth band; no second fill or projection pass is performed. |
 
-The **Ground grid** setting controls the sparse world-space XY reference grid. It is separate from the surface mesh drawn by **Solid + Grid**.
+The **Ground grid** setting controls the sparse world-space XY reference grid.
 
 ## Controls
 
@@ -78,7 +77,7 @@ The edited source and last successfully compiled expression are separate. An inv
 
 ### Settings content
 
-The seven Settings rows are **Rendering**, **Ground grid**, **Axes**, **Ticks**, **Labels**, **Domain**, and **Reset camera**.
+The eight Settings rows are **Rendering**, **Ground grid**, **Axes**, **Ticks**, **Labels**, **Domain**, **Reset camera**, and **Performance**. Performance toggles the optional latest render-time/FPS readout; it is off by default and does not invalidate graph pixels.
 
 | Input | Action |
 | --- | --- |
@@ -137,7 +136,7 @@ regular height-field traversal + bounded axes/grid/labels
 27 EADK graph-viewport transfers
 ```
 
-The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Ambient-plus-Lambert lighting and triangle validity are calculated once per triangle per solid redraw, outside the 27-band loop. Solid + Grid traverses each unique horizontal or vertical height-field edge once per band topology pass (906 edges), reusing the completed fill depth instead of repeating expensive surface work.
+The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Ambient-plus-Lambert lighting and triangle validity are calculated once per triangle per solid redraw, outside the 27-band loop.
 
 The input/UI path is deliberately split:
 
@@ -191,14 +190,13 @@ Every graph redraw uses one immutable camera state. It projects the cached surfa
 4. Draw coordinate-label background rectangles.
 5. Draw numeric 5×7 bitmap labels.
 6. Draw the wireframe or depth-tested solid surface.
-7. In Solid + Grid, draw the depth-tested surface-grid overlay.
 8. Draw tick marks and the origin.
 9. Draw X/Y/Z bitmap labels.
 10. Push the completed band with EADK.
 
 Numeric labels precede the surface and can be covered by it; ticks, the origin, and axis names are deliberately composed afterward for readability. Graph labels remain inside the band buffer. Do not replace them with `eadk_display_draw_string()` or draw directly to the display between band transfers: doing so can expose stale labels during camera redraws and was the cause of a previous flashing/alternating-frame artifact. Firmware text drawing remains appropriate for independently redrawn header, Equation, and Settings UI regions.
 
-Solid projection encodes normalized reciprocal camera-space depth into `u16`: zero is invalid and larger values are nearer. Reciprocal depth is stepped across each triangle together with incremental integer edge equations, so covered pixels avoid repeated edge evaluations and per-pixel division. Solid + Grid compares its interpolated edge depth with the completed fill depth and does not expose hidden back-facing edges.
+Solid projection encodes normalized reciprocal camera-space depth into `u16`: zero is invalid and larger values are nearer. Reciprocal depth is stepped across each triangle together with incremental integer edge equations, so covered pixels avoid repeated edge evaluations and per-pixel division.
 
 ## Known rendering limitations
 
@@ -210,16 +208,16 @@ Solid projection encodes normalized reciprocal camera-space depth into `u16`: ze
 
 ## Hardware performance and visual validation
 
-Real NumWorks hardware is the performance and UX target. Host timings are not evidence that Solid or Solid + Grid is fast enough, and automated tests cannot establish perceived lighting quality, surface readability, grid/axis composition, depth artifacts, label readability, camera-motion smoothness, or overall usability.
+Real NumWorks hardware is the performance and UX target. Host timings are not evidence that Solid is fast enough, and automated tests cannot establish perceived lighting quality, surface readability, grid/axis composition, depth artifacts, label readability, camera-motion smoothness, or overall usability.
 
-**Hardware sign-off for this solid-rendering milestone is still pending.** Building and host tests validate integration but do not complete the milestone. A debug build temporarily measures the complete graph render—including vertical-blank waiting and display transfers—and shows `Last:…ms` in Settings. Release builds contain neither that field nor the profiling readout.
+The application records the complete graph render—including vertical-blank waiting and display transfers—in every build. The Settings tab's **Performance** option controls whether the latest `Last:…ms …FPS` readout is shown; it is off by default. The optional `RENDER_FREEZE_DIAGNOSTICS` flag in `src/main.rs` enables a small Solid-render phase/band breadcrumb for future hardware investigations; it is off in the release configuration.
 
-Before sign-off, install with `cargo run` and test all three rendering modes at identical domains and camera states with:
+Before sign-off, install with `cargo run` and test both rendering modes at identical domains and camera states with:
 
 - `sin(x) * cos(y)` — baseline composition and lighting
 - `x^2 + y^2` — bowl depth and gradients
 - `x^2 - y^2` — saddle readability
-- `sin(sqrt(x^2 + y^2))` — radial detail and surface-grid clarity
+- `sin(sqrt(x^2 + y^2))` — radial detail
 - `sqrt(x)` — open invalid negative-X region
 - `1/x` — no triangles bridging the pole
 - `tan(x)` — discontinuity gaps without screen-sized spikes
@@ -227,17 +225,17 @@ Before sign-off, install with `cargo run` and test all three rendering modes at 
 
 For each expression, orbit, pan, dolly, and change FOV while checking lighting, shape readability, ground-grid/axis composition, depth artifacts, labels, continuous-camera smoothness, and invalid-region behavior. Compare Wireframe directly with the released 2.0.0 baseline experience.
 
-Solid + Grid is acceptable only when it adds no noticeable control lag and costs no more than approximately `max(5 ms, 25%)` over Solid at the default view. If a technically correct feature makes the calculator noticeably less responsive, responsiveness wins: optimize incremental rasterization and rejection first, eliminate repeated work, reduce overlay density if necessary, and simplify lighting/overlay detail before accepting an interaction regression. Do not alter the wireframe renderer to hide solid-mode performance costs.
+If a technically correct feature makes the calculator noticeably less responsive, responsiveness wins: optimize incremental rasterization and rejection before accepting an interaction regression. Do not alter the wireframe renderer to hide solid-mode performance costs.
 
 ## Project structure
 
 | Path | Responsibility |
 | --- | --- |
-| `src/main.rs` | NWA metadata, exported entry point, cooperative input/render loop, surface-cache ownership, and debug render timing |
+| `src/main.rs` | NWA metadata, exported entry point, cooperative input/render loop, surface-cache ownership, render timing, and optional freeze diagnostics |
 | `src/app.rs` | Tab/content focus state machine, graph options, domain state, and header/content/graph/surface dirty flags |
 | `src/eadk.rs` | Rust FFI layout, constants, and guarded wrappers for firmware display, keyboard, event, and timing symbols |
 | `src/editor.rs` | Fixed 96-byte Equation editor, cursor/scroll logic, calculator event mapping, and held-key repeat |
-| `src/settings.rs` | Seven-row Settings interaction and fixed 24-byte transactional domain editor |
+| `src/settings.rs` | Eight-row Settings interaction, optional performance readout, and fixed 24-byte transactional domain editor |
 | `src/expression.rs` | Streaming tokenizer, shunting-yard parser, fixed postfix bytecode, and stack evaluator |
 | `src/function.rs` | `SurfaceFunction` boundary between evaluation and sampling |
 | `src/surface.rs` | Domain validation/mapping, 25×19 sampling, cached heights, discontinuity rejection, and transient triangle lighting |
@@ -300,7 +298,15 @@ The final command requires a connected calculator and begins the mandatory physi
 
 ## Version policy
 
-Settings displays the manually maintained version string **`v2.0.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+Settings displays the manually maintained version string **`v2.1.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+
+## v2.1.0 changes
+
+- Removed the unstable Solid + Grid mode. Rendering now offers the proven Wireframe baseline and depth-tested Solid mode only.
+- Preserved Wireframe's separate 25×19, 27-band path and its released controls/composition.
+- Added an optional Settings performance readout showing the latest complete render duration and derived FPS in every build.
+- Added an opt-in, compile-time Solid freeze breadcrumb (`RENDER_FREEZE_DIAGNOSTICS`) for hardware diagnosis; it is disabled in the release configuration.
+- Retained allocation-free, `no_std` operation with the existing 320×8 RGB565 band buffers and no full-screen framebuffer or depth buffer.
 
 ## Contributing and development rules
 

@@ -38,12 +38,13 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.0.0\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.1.0\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
 const VERSION_TEXT_X: u16 = (SCREEN_WIDTH - VERSION_TEXT_WIDTH) / 2;
 const VERSION_TEXT_Y: u16 = 218;
+const PERFORMANCE_TEXT_Y: u16 = 204;
 
 /// Draws all three tabs and the active/keyboard-focus indicator.
 pub fn draw_header(active: usize, selected: usize, tabs_focused: bool) {
@@ -225,7 +226,7 @@ pub fn draw_settings(
     options: GraphOptions,
     domain: Domain,
     focused: bool,
-    graph_render_ms: Option<u32>,
+    graph_render_ms: u32,
 ) {
     clear_content();
     match settings.page() {
@@ -242,14 +243,14 @@ pub fn draw_settings(
         DARK_GRAY,
         WHITE,
     );
-    if let Some(milliseconds) = graph_render_ms {
-        let mut text = [0_u8; 16];
-        let text = format_render_milliseconds(milliseconds, &mut text);
+    if options.show_performance {
+        let mut text = [0_u8; 24];
+        let text = format_render_performance(graph_render_ms, &mut text);
         eadk::display::draw_string(
             text,
             Point {
                 x: 4,
-                y: VERSION_TEXT_Y,
+                y: PERFORMANCE_TEXT_Y,
             },
             false,
             DARK_GRAY,
@@ -258,7 +259,7 @@ pub fn draw_settings(
     }
 }
 
-fn format_render_milliseconds(value: u32, buffer: &mut [u8; 16]) -> &[u8] {
+fn format_render_performance(value: u32, buffer: &mut [u8; 24]) -> &[u8] {
     let prefix = b"Last:";
     let mut index = 0;
     while index < prefix.len() {
@@ -283,13 +284,36 @@ fn format_render_milliseconds(value: u32, buffer: &mut [u8; 16]) -> &[u8] {
     }
     buffer[index] = b'm';
     buffer[index + 1] = b's';
-    buffer[index + 2] = 0;
-    &buffer[..index + 3]
+    index += 2;
+    buffer[index] = b' ';
+    index += 1;
+    let fps = if value == 0 { 0 } else { 1000 / value };
+    let mut fps_reverse = [0_u8; 10];
+    let mut fps_count = 0;
+    let mut remaining = fps;
+    loop {
+        fps_reverse[fps_count] = b'0' + (remaining % 10) as u8;
+        fps_count += 1;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    while fps_count > 0 {
+        fps_count -= 1;
+        buffer[index] = fps_reverse[fps_count];
+        index += 1;
+    }
+    buffer[index] = b'F';
+    buffer[index + 1] = b'P';
+    buffer[index + 2] = b'S';
+    buffer[index + 3] = 0;
+    &buffer[..index + 4]
 }
 
 const SETTINGS_ROW_TOP: u16 = 30;
-const SETTINGS_ROW_HEIGHT: u16 = 25;
-const SETTINGS_LABELS: [&[u8]; 7] = [
+const SETTINGS_ROW_HEIGHT: u16 = 22;
+const SETTINGS_LABELS: [&[u8]; 8] = [
     b"Rendering\0",
     b"Ground grid\0",
     b"Axes\0",
@@ -297,6 +321,7 @@ const SETTINGS_LABELS: [&[u8]; 7] = [
     b"Labels\0",
     b"Domain\0",
     b"Reset camera\0",
+    b"Performance\0",
 ];
 
 fn draw_settings_menu(settings: &SettingsState, options: GraphOptions, focused: bool) {
@@ -350,12 +375,12 @@ fn setting_value(item: SettingsItem, options: GraphOptions) -> (&'static [u8], u
         SettingsItem::RenderingMode => match options.rendering_mode {
             RenderingMode::Wireframe => (b"Wireframe\0", 228),
             RenderingMode::Solid => (b"Solid\0", 270),
-            RenderingMode::SolidGrid => (b"Solid + grid\0", 221),
         },
         SettingsItem::GroundGrid => on_off(options.show_grid),
         SettingsItem::Axes => on_off(options.show_axes),
         SettingsItem::Ticks => on_off(options.show_ticks),
         SettingsItem::Labels => on_off(options.show_labels),
+        SettingsItem::Performance => on_off(options.show_performance),
         SettingsItem::Domain => (b"EXE >\0", 270),
         SettingsItem::ResetCamera => (b"EXE\0", 284),
     }
@@ -581,14 +606,17 @@ mod tests {
 
     #[test]
     fn displayed_release_version_remains_manually_fixed() {
-        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.0.0\0");
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.1.0\0");
     }
 
     #[test]
-    fn debug_render_time_is_bounded_and_c_terminated() {
-        let mut buffer = [0_u8; 16];
-        assert_eq!(format_render_milliseconds(37, &mut buffer), b"Last:37ms\0");
-        let text = format_render_milliseconds(u32::MAX, &mut buffer);
+    fn render_performance_text_is_bounded_and_c_terminated() {
+        let mut buffer = [0_u8; 24];
+        assert_eq!(
+            format_render_performance(100, &mut buffer),
+            b"Last:100ms 10FPS\0"
+        );
+        let text = format_render_performance(u32::MAX, &mut buffer);
         assert_eq!(text.last(), Some(&0));
         assert!(text.len() <= buffer.len());
     }

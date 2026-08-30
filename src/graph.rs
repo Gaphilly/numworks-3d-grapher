@@ -17,26 +17,22 @@ pub enum RenderingMode {
     Wireframe,
     /// Lit, depth-tested filled triangles.
     Solid,
-    /// Filled triangles with the original surface mesh drawn on top.
-    SolidGrid,
 }
 
 impl RenderingMode {
-    /// Cycles forward through the three user-visible modes.
+    /// Cycles forward through the two user-visible modes.
     pub fn next(self) -> RenderingMode {
         match self {
             RenderingMode::Wireframe => RenderingMode::Solid,
-            RenderingMode::Solid => RenderingMode::SolidGrid,
-            RenderingMode::SolidGrid => RenderingMode::Wireframe,
+            RenderingMode::Solid => RenderingMode::Wireframe,
         }
     }
 
     /// Cycles backward through the three user-visible modes.
     pub fn previous(self) -> RenderingMode {
         match self {
-            RenderingMode::Wireframe => RenderingMode::SolidGrid,
+            RenderingMode::Wireframe => RenderingMode::Solid,
             RenderingMode::Solid => RenderingMode::Wireframe,
-            RenderingMode::SolidGrid => RenderingMode::Solid,
         }
     }
 }
@@ -55,6 +51,8 @@ pub struct GraphOptions {
     pub show_ticks: bool,
     /// Numeric tick values and X/Y/Z bitmap labels.
     pub show_labels: bool,
+    /// Shows the latest complete graph redraw duration and derived FPS in Settings.
+    pub show_performance: bool,
 }
 
 impl GraphOptions {
@@ -65,6 +63,7 @@ impl GraphOptions {
         show_axes: true,
         show_ticks: true,
         show_labels: true,
+        show_performance: false,
     };
 }
 
@@ -75,8 +74,6 @@ pub struct GraphPalette {
     pub background: Color,
     /// Unlit base tint multiplied by the cached triangle light level.
     pub solid_surface: Color,
-    /// Subtle depth-tested height-field lines used by Solid + Grid.
-    pub solid_grid: Color,
     pub surface: Color,
     pub grid: Color,
     pub x_axis: Color,
@@ -90,7 +87,6 @@ pub struct GraphPalette {
 pub const PALETTE: GraphPalette = GraphPalette {
     background: Color { rgb565: 0xffff },
     solid_surface: Color { rgb565: 0x2d9f },
-    solid_grid: Color { rgb565: 0x10b0 },
     surface: Color { rgb565: 0x001f },
     grid: Color { rgb565: 0xd69a },
     x_axis: Color { rgb565: 0xb800 },
@@ -249,11 +245,7 @@ mod tests {
     #[test]
     fn rendering_modes_cycle_in_both_directions() {
         assert_eq!(RenderingMode::Wireframe.next(), RenderingMode::Solid);
-        assert_eq!(RenderingMode::Solid.next(), RenderingMode::SolidGrid);
-        assert_eq!(RenderingMode::SolidGrid.next(), RenderingMode::Wireframe);
-        assert_eq!(
-            RenderingMode::Wireframe.previous(),
-            RenderingMode::SolidGrid
-        );
+        assert_eq!(RenderingMode::Solid.next(), RenderingMode::Wireframe);
+        assert_eq!(RenderingMode::Wireframe.previous(), RenderingMode::Solid);
     }
 }

@@ -27,7 +27,7 @@ pub const NUMERIC_CAPACITY: usize = 24;
 /// Number of fixed-width characters intended to fit in the Settings value field.
 pub const NUMERIC_VISIBLE_CHARACTERS: usize = 20;
 /// Number of selectable rows on the main Settings page.
-pub const SETTINGS_ITEM_COUNT: usize = 7;
+pub const SETTINGS_ITEM_COUNT: usize = 8;
 /// Number of editable bounds on the Domain page.
 pub const DOMAIN_FIELD_COUNT: usize = 4;
 
@@ -48,6 +48,7 @@ pub enum SettingsItem {
     Labels,
     Domain,
     ResetCamera,
+    Performance,
 }
 
 impl SettingsItem {
@@ -61,6 +62,7 @@ impl SettingsItem {
             SettingsItem::Labels => 4,
             SettingsItem::Domain => 5,
             SettingsItem::ResetCamera => 6,
+            SettingsItem::Performance => 7,
         }
     }
 
@@ -74,7 +76,8 @@ impl SettingsItem {
             3 => SettingsItem::Ticks,
             4 => SettingsItem::Labels,
             5 => SettingsItem::Domain,
-            _ => SettingsItem::ResetCamera,
+            6 => SettingsItem::ResetCamera,
+            _ => SettingsItem::Performance,
         }
     }
 }
@@ -400,6 +403,10 @@ impl SettingsState {
                 options.show_labels = !options.show_labels;
                 SettingsAction::GraphChanged
             }
+            SettingsItem::Performance => {
+                options.show_performance = !options.show_performance;
+                SettingsAction::Redraw
+            }
             SettingsItem::Domain => {
                 self.page = SettingsPage::Domain;
                 self.editing = false;
@@ -482,10 +489,16 @@ impl SettingsState {
             SettingsItem::Axes => set_bool(&mut options.show_axes, right),
             SettingsItem::Ticks => set_bool(&mut options.show_ticks, right),
             SettingsItem::Labels => set_bool(&mut options.show_labels, right),
+            SettingsItem::Performance => set_bool(&mut options.show_performance, right),
             SettingsItem::Domain | SettingsItem::ResetCamera => false,
         };
         if changed {
-            SettingsAction::GraphChanged
+            if self.selected_item() == SettingsItem::Performance {
+                // The readout is UI-only; toggling it must not invalidate graph pixels.
+                SettingsAction::Redraw
+            } else {
+                SettingsAction::GraphChanged
+            }
         } else {
             SettingsAction::None
         }
@@ -905,6 +918,23 @@ mod tests {
             SettingsAction::ResetCamera
         );
         assert_eq!(state.selected_item(), SettingsItem::ResetCamera);
+    }
+
+    #[test]
+    fn performance_readout_toggle_is_ui_only() {
+        let mut state = SettingsState::new();
+        let mut options = GraphOptions::DEFAULT;
+        move_to(&mut state, SettingsItem::Performance);
+        assert!(!options.show_performance);
+        assert_eq!(state.adjust_right(&mut options), SettingsAction::Redraw);
+        assert!(options.show_performance);
+        assert_eq!(state.adjust_left(&mut options), SettingsAction::Redraw);
+        assert!(!options.show_performance);
+        assert_eq!(
+            state.activate(&mut options, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert!(options.show_performance);
     }
 
     #[test]

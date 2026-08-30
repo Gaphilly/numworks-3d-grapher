@@ -22,6 +22,11 @@ mod settings;
 mod surface;
 mod ui;
 
+// Set false to disable all freeze-diagnostic header breadcrumbs. This is kept
+// separate from the Settings Performance readout: a stuck frame cannot publish
+// its final duration, so the breadcrumb is useful even when that readout is off.
+const RENDER_FREEZE_DIAGNOSTICS: bool = false;
+
 #[cfg(not(test))]
 /// NUL-terminated name exposed in the NWA metadata section.
 #[used]
@@ -66,10 +71,14 @@ pub extern "C" fn main() {
                         surface.resample(app.domain, &function);
                         app.dirty.surface = false;
                     }
-                    #[cfg(debug_assertions)]
                     let render_started_ms = eadk::timing::millis();
-                    rendering::render(&app.camera, app.domain, &surface, app.graph_options);
-                    #[cfg(debug_assertions)]
+                    rendering::render(
+                        &app.camera,
+                        app.domain,
+                        &surface,
+                        app.graph_options,
+                        RENDER_FREEZE_DIAGNOSTICS,
+                    );
                     app.record_graph_render_ms(
                         eadk::timing::millis().saturating_sub(render_started_ms),
                     );

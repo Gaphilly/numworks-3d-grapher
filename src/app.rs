@@ -96,7 +96,6 @@ pub struct AppState {
     pub focus: Focus,
     pub dirty: DirtyFlags,
     pub editor: EquationEditor,
-    #[cfg(debug_assertions)]
     last_graph_render_ms: u32,
     editor_repeat: EditorKeyRepeat,
     previous_keys: keyboard::State,
@@ -121,7 +120,6 @@ impl AppState {
                 surface: true,
             },
             editor: EquationEditor::new(),
-            #[cfg(debug_assertions)]
             last_graph_render_ms: 0,
             editor_repeat: EditorKeyRepeat::new(),
             previous_keys: 0,
@@ -134,21 +132,12 @@ impl AppState {
         self.pressed_keys
     }
 
-    /// Debug-build hardware profiling result. Release builds retain neither the
-    /// field nor a Settings readout.
-    pub fn graph_render_profile_ms(&self) -> Option<u32> {
-        #[cfg(debug_assertions)]
-        {
-            Some(self.last_graph_render_ms)
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            None
-        }
+    /// Duration of the latest complete graph redraw, including display transfer.
+    pub fn graph_render_profile_ms(&self) -> u32 {
+        self.last_graph_render_ms
     }
 
     /// Records one complete graph render for the temporary hardware profiler.
-    #[cfg(debug_assertions)]
     pub fn record_graph_render_ms(&mut self, elapsed_ms: u64) {
         self.last_graph_render_ms = elapsed_ms.min(u32::MAX as u64) as u32;
     }

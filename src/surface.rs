@@ -1,9 +1,10 @@
 //! Mathematical domain and fixed-resolution surface sampling.
 //!
-//! The renderer uses a regular 25×19 grid. Only the 475 `f32` heights are cached;
-//! `x` and `y` are recovered from the domain, avoiding redundant RAM. Solid-only
-//! triangle lighting is built into a caller-owned transient array so selecting
-//! wireframe retains the original surface-cache and render-stack footprint.
+//! The renderer uses a regular 25×19 grid. Heights plus the exact sampled X/Y
+//! coordinates are cached so Solid camera redraws never repeat domain divisions.
+//! Solid-only triangle lighting is rebuilt only when sampling changes, avoiding
+//! normal/square-root work while orbiting. Wireframe deliberately retains its
+//! established point-reconstruction path and does not consume either cache.
 //! Equation bytecode is evaluated only after an expression/domain change, never
 //! for a camera-only redraw.
 
@@ -131,12 +132,16 @@ pub struct Point3 {
 
 /// Fixed-capacity height cache for the current compiled expression and domain.
 ///
-/// Heights occupy exactly 1,900 bytes plus small range metadata. NaN/infinite
-/// evaluations remain in this cache and later invalidate every solid triangle
-/// that touches them, so ordinary invalid mathematical input cannot reach
-/// triangle rasterization or bridge a discontinuity.
+/// Heights occupy 1,900 bytes; Solid adds 176 bytes of cached X/Y coordinates
+/// and 864 bytes of cached triangle shades. NaN/infinite evaluations remain in
+/// the height cache and later invalidate every touching Solid triangle, so
+/// ordinary invalid mathematical input cannot reach rasterization or bridge a
+/// discontinuity.
 pub struct SurfaceGrid {
     heights: [[f32; COLUMNS]; ROWS],
+    sample_x: [f32; COLUMNS],
+    sample_y: [f32; ROWS],
+    triangle_shades: TriangleShades,
     z_min: f32,
     z_max: f32,
     has_finite_height: bool,
@@ -147,6 +152,9 @@ impl SurfaceGrid {
     pub fn sample<F: SurfaceFunction>(domain: Domain, function: &F) -> SurfaceGrid {
         let mut grid = SurfaceGrid {
             heights: [[f32::NAN; COLUMNS]; ROWS],
+            sample_x: [f32::NAN; COLUMNS],
+            sample_y: [f32::NAN; ROWS],
+            triangle_shades: [[[0; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1],
             z_min: 0.0,
             z_max: 0.0,
             has_finite_height: false,
@@ -161,12 +169,23 @@ impl SurfaceGrid {
         self.z_max = 0.0;
         self.has_finite_height = false;
 
+        let mut column = 0;
+        while column < COLUMNS {
+            self.sample_x[column] = domain.sample_x(column, COLUMNS);
+            column += 1;
+        }
         let mut row = 0;
         while row < ROWS {
-            let y = domain.sample_y(row, ROWS);
-            let mut column = 0;
+            self.sample_y[row] = domain.sample_y(row, ROWS);
+            row += 1;
+        }
+
+        row = 0;
+        while row < ROWS {
+            let y = self.sample_y[row];
+            column = 0;
             while column < COLUMNS {
-                let x = domain.sample_x(column, COLUMNS);
+                let x = self.sample_x[column];
                 let z = function.evaluate(x, y);
                 self.heights[row][column] = z;
                 if z.is_finite() {
@@ -187,6 +206,7 @@ impl SurfaceGrid {
             }
             row += 1;
         }
+        self.rebuild_triangle_shades(domain);
     }
 
     /// Reconstructs one world point without reevaluating the expression.
@@ -206,18 +226,45 @@ impl SurfaceGrid {
         }
     }
 
+    /// Returns one cached-coordinate point for Solid projection only.
+    ///
+    /// The cached coordinates are exactly those used for the most recent
+    /// sampling pass. Keeping this separate from [`Self::point`] protects the
+    /// released Wireframe call path from Solid-specific optimization changes.
+    pub fn solid_point(&self, column: usize, row: usize) -> Point3 {
+        if row >= ROWS || column >= COLUMNS {
+            return Point3 {
+                x: f32::NAN,
+                y: f32::NAN,
+                z: f32::NAN,
+            };
+        }
+        Point3 {
+            x: self.sample_x[column],
+            y: self.sample_y[row],
+            z: self.heights[row][column],
+        }
+    }
+
+    /// Returns the cached Solid triangle validity/light values.
+    ///
+    /// This is rebuilt transactionally at the end of each surface resample, so
+    /// camera-only redraws do not recompute 864 normals, square roots, or
+    /// divisions. Wireframe never reads this cache.
+    pub fn triangle_shades(&self) -> &TriangleShades {
+        &self.triangle_shades
+    }
+
     /// Cached finite height range and whether at least one finite sample exists.
     pub fn z_range(&self) -> (f32, f32, bool) {
         (self.z_min, self.z_max, self.has_finite_height)
     }
 
-    /// Builds solid-mode Lambert lighting and triangle validity into transient
-    /// caller-owned storage. Wireframe never calls this function or reserves the
-    /// 864-byte array on its render stack.
+    /// Rebuilds Solid-mode Lambert lighting and triangle validity after sampling.
     ///
     /// Triangle zero is `(top-left, top-right, bottom-right)` and triangle one
     /// is `(top-left, bottom-right, bottom-left)`. Both wind toward world `+z`.
-    pub fn build_triangle_shades(&self, domain: Domain, shades: &mut TriangleShades) {
+    fn rebuild_triangle_shades(&mut self, domain: Domain) {
         let maximum_height_jump =
             discontinuity_limit(domain, self.z_min, self.z_max, self.has_finite_height);
         let mut row = 0;
@@ -234,6 +281,32 @@ impl SurfaceGrid {
                 // larger than a neighboring delta. Reject the complete regular
                 // cell in that case; this leaves a conservative gap without
                 // changing the released wireframe path or evaluating midpoints.
+                if self.cell_reverses_sample_trend(row, column) {
+                    self.triangle_shades[row][column] = [0; TRIANGLES_PER_CELL];
+                } else {
+                    self.triangle_shades[row][column][0] =
+                        triangle_light(top_left, top_right, bottom_right, maximum_height_jump);
+                    self.triangle_shades[row][column][1] =
+                        triangle_light(top_left, bottom_right, bottom_left, maximum_height_jump);
+                }
+                column += 1;
+            }
+            row += 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn build_triangle_shades_reference(&self, domain: Domain, shades: &mut TriangleShades) {
+        let maximum_height_jump =
+            discontinuity_limit(domain, self.z_min, self.z_max, self.has_finite_height);
+        let mut row = 0;
+        while row + 1 < ROWS {
+            let mut column = 0;
+            while column + 1 < COLUMNS {
+                let top_left = self.point(domain, column, row);
+                let top_right = self.point(domain, column + 1, row);
+                let bottom_left = self.point(domain, column, row + 1);
+                let bottom_right = self.point(domain, column + 1, row + 1);
                 if self.cell_reverses_sample_trend(row, column) {
                     shades[row][column] = [0; TRIANGLES_PER_CELL];
                 } else {
@@ -425,10 +498,8 @@ mod tests {
     use crate::expression::CompiledExpression;
     use core::cell::Cell;
 
-    fn triangle_shades(grid: &SurfaceGrid, domain: Domain) -> TriangleShades {
-        let mut shades = [[[0; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
-        grid.build_triangle_shades(domain, &mut shades);
-        shades
+    fn triangle_shades(grid: &SurfaceGrid, _domain: Domain) -> TriangleShades {
+        *grid.triangle_shades()
     }
 
     fn shade_counts(shades: &TriangleShades) -> (usize, usize) {
@@ -460,6 +531,29 @@ mod tests {
         fn evaluate(&self, x: f32, y: f32) -> f32 {
             x + y
         }
+    }
+
+    #[test]
+    fn solid_coordinate_and_lighting_caches_match_the_sampling_reference() {
+        let domain = Domain::new(-2.5, 3.75, -4.0, 1.5);
+        let grid = SurfaceGrid::sample(domain, &Plane);
+        let mut row = 0;
+        while row < ROWS {
+            let mut column = 0;
+            while column < COLUMNS {
+                let wireframe_point = grid.point(domain, column, row);
+                let solid_point = grid.solid_point(column, row);
+                assert_eq!(solid_point.x, wireframe_point.x);
+                assert_eq!(solid_point.y, wireframe_point.y);
+                assert_eq!(solid_point.z, wireframe_point.z);
+                column += 1;
+            }
+            row += 1;
+        }
+
+        let mut reference = [[[0; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
+        grid.build_triangle_shades_reference(domain, &mut reference);
+        assert_eq!(*grid.triangle_shades(), reference);
     }
 
     #[test]
@@ -521,9 +615,9 @@ mod tests {
         assert_ne!(shades[0][0][0], 0);
         assert_ne!(shades[ROWS - 2][COLUMNS - 2][1], 0);
         assert_eq!(core::mem::size_of::<TriangleShades>(), 864);
-        // Keeping lighting transient preserves the original wireframe cache:
-        // 1,900 height bytes, two f32 bounds, one bool, and alignment padding.
-        assert_eq!(core::mem::size_of::<SurfaceGrid>(), 1_912);
+        // 1,900 height bytes plus 864 cached shades and 176 cached X/Y bytes,
+        // with the range metadata/alignment required by the target ABI.
+        assert_eq!(core::mem::size_of::<SurfaceGrid>(), 2_952);
     }
 
     #[test]
@@ -591,8 +685,11 @@ mod tests {
             heights[y][column + 2] = 9.0;
             y += 1;
         }
-        let grid = SurfaceGrid {
+        let mut grid = SurfaceGrid {
             heights,
+            sample_x: [f32::NAN; COLUMNS],
+            sample_y: [f32::NAN; ROWS],
+            triangle_shades: [[[0; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1],
             z_min: -1.0,
             z_max: 10.0,
             has_finite_height: true,
@@ -601,6 +698,7 @@ mod tests {
         assert!(horizontal_edge_reverses_trend(&grid.heights, row, column));
         assert!(grid.cell_reverses_sample_trend(row, column));
 
+        grid.rebuild_triangle_shades(Domain::DEFAULT);
         let shades = triangle_shades(&grid, Domain::DEFAULT);
         assert_eq!(shades[row][column], [0, 0]);
         assert_ne!(shades[row][column - 1], [0, 0]);

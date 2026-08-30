@@ -17,9 +17,9 @@
 use crate::camera::{Camera, ProjectedLine, ProjectedPoint, Projector, ScreenPoint};
 use crate::eadk::{self, Color, Point, Rect};
 use crate::graph::{self, AxisVisibility, GraphOptions, RenderingMode, TickGenerator, PALETTE};
-use crate::surface::{
-    Domain, Point3, SurfaceGrid, TriangleShades, COLUMNS, ROWS, TRIANGLES_PER_CELL,
-};
+#[cfg(test)]
+use crate::surface::TRIANGLES_PER_CELL;
+use crate::surface::{Domain, Point3, SurfaceGrid, TriangleShades, COLUMNS, ROWS};
 
 const SCREEN_WIDTH: usize = 320;
 const SCREEN_HEIGHT: usize = 240;
@@ -402,11 +402,9 @@ fn render_solid(
     diagnostics_enabled: bool,
 ) {
     diagnostic_marker(diagnostics_enabled, b"P00\0");
-    // Lighting is solid-only transient state. Keeping it in this separate call
-    // path prevents both its calculation and its 864-byte stack allocation from
-    // affecting the established wireframe renderer.
-    let mut triangle_shades = [[[0_u8; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
-    surface.build_triangle_shades(domain, &mut triangle_shades);
+    // Lighting is cached at surface-sampling time. This Solid-only path avoids
+    // recomputing 864 normals/square roots/divisions on camera-only redraws.
+    let triangle_shades = surface.triangle_shades();
     let mut projected = [[SolidVertex::INVALID; COLUMNS]; ROWS];
     let projector = camera.projector();
     let (z_min, z_max, has_height) = surface.z_range();
@@ -414,7 +412,7 @@ fn render_solid(
     while row < ROWS {
         let mut column = 0;
         while column < COLUMNS {
-            let point = surface.point(domain, column, row);
+            let point = surface.solid_point(column, row);
             if let Some(point) = projector.project_with_depth(point) {
                 let inverse_depth = encode_inverse_depth(point.depth);
                 if inverse_depth != 0 {
@@ -453,13 +451,7 @@ fn render_solid(
         draw_label_backgrounds(&mut pixels, band_y, &geometry);
         draw_labels(&mut pixels, band_y, &geometry, true);
         diagnostic_marker_band(diagnostics_enabled, b'F', band_y);
-        draw_solid_surface(
-            &mut pixels,
-            &mut depth,
-            band_y,
-            &projected,
-            &triangle_shades,
-        );
+        draw_solid_surface(&mut pixels, &mut depth, band_y, &projected, triangle_shades);
         draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
         draw_origin(&mut pixels, band_y, geometry.origin);
         draw_labels(&mut pixels, band_y, &geometry, false);

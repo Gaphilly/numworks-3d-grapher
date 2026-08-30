@@ -125,7 +125,7 @@ fixed-stack f32 evaluator
 orbit-target camera transform + perspective projection
         ├── Wireframe: compact screen-point cache
         └── Solid: compact screen point + inverse-depth cache
-                    + 864 transient triangle shades
+                    + cached triangle light/validity values
         ↓
 regular height-field traversal + bounded axes/grid/labels
         ↓
@@ -136,7 +136,7 @@ regular height-field traversal + bounded axes/grid/labels
 27 EADK graph-viewport transfers
 ```
 
-The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Ambient-plus-Lambert lighting and triangle validity are calculated once per triangle per solid redraw, outside the 27-band loop.
+The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Ambient-plus-Lambert lighting and triangle validity are calculated once when the surface is sampled, never during a camera-only Solid redraw.
 
 The input/UI path is deliberately split:
 
@@ -160,10 +160,9 @@ There is no allocator and no heap-backed collection. Rendering storage is fixed-
 | --- | ---: | --- |
 | RGB565 color band | 320×8×2 = 5,120 bytes | Every graph render path |
 | Solid inverse-depth band | 320×8×2 = 5,120 bytes | Solid modes only |
-| Cached surface heights | 25×19 `f32` = 1,900 bytes, plus range metadata | Active graph |
+| Surface cache | 1,900-byte heights + 176-byte X/Y coordinates + 864-byte triangle light/validity cache | Active graph |
 | Wireframe projected cache | 25×19 `(i16, i16)` = 1,900 bytes | Wireframe render only |
 | Solid projected cache | 25×19 `(i16, i16, u16)` = approximately 2,850 bytes | Solid render only |
-| Triangle light/validity cache | 24×18×2 `u8` = 864 bytes | Solid render only |
 | Expression source | 96 bytes | Equation editor state |
 | Domain numeric source | 24 bytes, plus terminator/state | Settings editor state |
 | Postfix bytecode | 64 fixed instructions | Active expression |
@@ -174,7 +173,7 @@ There is no allocator and no heap-backed collection. Rendering storage is fixed-
 
 A full 320×240 RGB565 framebuffer would consume 153,600 bytes, and a full-screen 16-bit depth buffer would consume another 153,600 bytes. Both are avoided. The graph viewport is 216 pixels high below its 24-pixel header, so the renderer composes exactly 27 eight-row bands and performs one EADK rectangle transfer per band—never one firmware call per pixel.
 
-Wireframe and solid use separate call paths. Wireframe therefore retains its established color-band and projected-cache footprint and does not reserve the solid-only 5,120-byte depth band, approximately 2,850-byte projected vertex array, or 864-byte lighting array.
+Wireframe and solid use separate render call paths. Wireframe retains its established color-band and projected-cache footprint and does not reserve the Solid-only 5,120-byte depth band or approximately 2,850-byte projected vertex array. The 1,040-byte surface cache extension is persistent so Solid camera redraws can reuse exact sampled coordinates and lighting; Wireframe does not read it.
 
 ### Stack budget
 
@@ -298,7 +297,14 @@ The final command requires a connected calculator and begins the mandatory physi
 
 ## Version policy
 
-Settings displays the manually maintained version string **`v2.1.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+Settings displays the manually maintained version string **`v2.2.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+
+## v2.2.0 changes
+
+- Caches exact sampled X/Y coordinates for the Solid projection path, removing repeated domain-coordinate divisions during camera-only redraws.
+- Caches the 864 Solid triangle light/validity values when a surface is sampled or resampled, removing normal construction, square roots, and divisions from camera-only Solid redraws.
+- Preserves the released Wireframe projection/render path; Wireframe does not read the new Solid caches.
+- Adds a reference-equivalence test for cached coordinates and triangle lighting, and documents the 1,040-byte active-surface cache extension.
 
 ## v2.1.0 changes
 

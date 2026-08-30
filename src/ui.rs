@@ -1,7 +1,16 @@
+//! Lightweight tab header and non-graph content drawing using EADK primitives.
+//!
+//! These views are redrawn only when their corresponding dirty flag is set.
+//! Direct firmware string drawing is appropriate here because each UI region is
+//! completed synchronously and is not interleaved with graph bands. Graph labels
+//! are different: they must remain bitmap glyphs inside `rendering`'s band buffer
+//! to preserve composition order and avoid stale/flashing text.
+
 use crate::eadk::{self, Color, Point, Rect};
 use crate::editor::{EquationEditor, VISIBLE_CHARACTERS};
 use crate::expression::ParseError;
 
+/// Header height; the graph renderer owns the remaining 320×216 viewport.
 pub const HEADER_HEIGHT: u16 = 24;
 const SCREEN_WIDTH: u16 = 320;
 const SCREEN_HEIGHT: u16 = 240;
@@ -20,6 +29,7 @@ const FIELD_BACKGROUND: Color = Color { rgb565: 0xffdf };
 const TAB_LABELS: [&[u8]; 3] = [b"Graph\0", b"Equation\0", b"Settings\0"];
 const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 
+/// Draws all three tabs and the active/keyboard-focus indicator.
 pub fn draw_header(active: usize, selected: usize, tabs_focused: bool) {
     let mut index = 0;
     while index < TAB_LABELS.len() {
@@ -67,6 +77,8 @@ pub fn draw_header(active: usize, selected: usize, tabs_focused: bool) {
     );
 }
 
+/// Redraws the Equation content region, fixed field, cursor, help, and parse error.
+/// The stack NUL-terminated copy is required by EADK's C string ABI.
 pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
     clear_content();
     eadk::display::draw_string(
@@ -186,6 +198,7 @@ pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
     );
 }
 
+/// Draws the allocation-free Settings placeholder until settings are implemented.
 pub fn draw_settings_placeholder() {
     clear_content();
     draw_centered_message(b"Settings\0", 79, 105);

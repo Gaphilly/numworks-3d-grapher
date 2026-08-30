@@ -1,3 +1,11 @@
+//! Small `f32` math routines for the `no_std` embedded target.
+//!
+//! These approximations avoid pulling desktop math crates/runtime assumptions
+//! into the relocatable NWA. They favor bounded code size and adequate graphing
+//! accuracy over correctly rounded libm behavior. Domain errors return NaN;
+//! overflow can return infinity, and the expression/projector layers reject all
+//! non-finite results before rasterization.
+
 const PI: f32 = 3.1415927;
 const HALF_PI: f32 = 1.5707964;
 const TWO_PI: f32 = 6.2831855;
@@ -12,6 +20,7 @@ fn wrap_angle(mut angle: f32) -> f32 {
     angle
 }
 
+/// Returns sine and cosine together after range reduction, sharing polynomial work.
 pub fn sin_cos(angle: f32) -> (f32, f32) {
     let mut x = wrap_angle(angle);
     let mut cosine_sign = 1.0;
@@ -30,6 +39,7 @@ pub fn sin_cos(angle: f32) -> (f32, f32) {
     (sin, cos)
 }
 
+/// Tangent derived from `sin_cos`; near singularities return NaN.
 pub fn tan(angle: f32) -> f32 {
     let (sin, cos) = sin_cos(angle);
     if cos.abs() < 0.0001 {
@@ -39,6 +49,7 @@ pub fn tan(angle: f32) -> f32 {
     }
 }
 
+/// Ten-iteration Newton square root; negative inputs return NaN.
 pub fn sqrt(value: f32) -> f32 {
     if value < 0.0 {
         return f32::NAN;
@@ -55,6 +66,8 @@ pub fn sqrt(value: f32) -> f32 {
     estimate
 }
 
+/// Real `f32` power. Integer exponents support negative bases; fractional
+/// exponents use the local `exp(exponent * ln(base))` approximation.
 pub fn pow(base: f32, exponent: f32) -> f32 {
     if exponent == 0.0 {
         return 1.0;

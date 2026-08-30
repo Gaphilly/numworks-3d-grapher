@@ -1,9 +1,27 @@
+//! Fixed-capacity expression compiler and postfix evaluator.
+//!
+//! `Parser` tokenizes ASCII directly from the source while applying the
+//! shunting-yard algorithm. Constants/variables are emitted immediately;
+//! operators and function markers use a fixed stack and are emitted as postfix
+//! bytecode. `^` and unary negation are right-associative, with power binding
+//! tighter, so `-2^2 == -(2^2)` and `2^3^2 == 2^(3^2)`.
+//!
+//! Compilation happens once on EXE. Surface sampling then evaluates compact
+//! bytecode repeatedly with a 32-entry `f32` stack. Every capacity violation and
+//! malformed expression returns a structured error; non-finite math becomes an
+//! evaluation error/NaN sentinel and is rejected before projection. No token,
+//! parser, bytecode, or evaluator storage uses the heap.
+
 use crate::function::SurfaceFunction;
 use crate::math;
 
+/// Maximum editable UTF-8 byte length (the editor currently inserts ASCII only).
 pub const MAX_EXPRESSION_LENGTH: usize = 96;
+/// Maximum postfix instructions, including embedded `f32` constants.
 pub const MAX_BYTECODE_LENGTH: usize = 64;
+/// Maximum pending shunting-yard operators/functions/parentheses.
 pub const MAX_OPERATOR_DEPTH: usize = 32;
+/// Maximum operand stack depth during validated evaluation.
 pub const MAX_EVALUATION_DEPTH: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -42,6 +60,7 @@ enum Operator {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Syntax or fixed-capacity failure reported while compiling source text.
 pub enum ParseError {
     EmptyExpression,
     ExpressionTooLong,
@@ -58,6 +77,7 @@ pub enum ParseError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Runtime bytecode or numerical failure.
 pub enum EvaluationError {
     StackUnderflow,
     StackOverflow,
@@ -65,12 +85,17 @@ pub enum EvaluationError {
     NonFiniteResult,
 }
 
+/// Allocation-free postfix program implementing `SurfaceFunction`.
+///
+/// A compiled value is independent of editor text. `EquationEditor::compile_into`
+/// replaces the active instance only after validation succeeds.
 pub struct CompiledExpression {
     code: [Instruction; MAX_BYTECODE_LENGTH],
     length: u8,
 }
 
 impl CompiledExpression {
+    /// Tokenizes, parses, emits postfix instructions, and validates stack depth.
     pub fn compile(source: &str) -> Result<Self, ParseError> {
         if source.len() > MAX_EXPRESSION_LENGTH {
             return Err(ParseError::ExpressionTooLong);
@@ -85,6 +110,7 @@ impl CompiledExpression {
         })
     }
 
+    /// Evaluates at `(x, y)` with a fixed `f32` stack and rejects non-finite output.
     pub fn evaluate_checked(&self, x: f32, y: f32) -> Result<f32, EvaluationError> {
         let mut stack = [0.0_f32; MAX_EVALUATION_DEPTH];
         let mut depth = 0_usize;
@@ -356,6 +382,8 @@ impl<'a> Parser<'a> {
             if matches!(top, Operator::LeftParenthesis) || is_function(top) {
                 break;
             }
+            // Equal-precedence right-associative operators stay on the stack.
+            // Negate's lower precedence than Power gives the desired `-x^2`.
             let should_pop = precedence(top) > precedence(operator)
                 || (precedence(top) == precedence(operator) && !is_right_associative(operator));
             if !should_pop {

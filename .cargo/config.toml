@@ -1,6 +1,12 @@
+# Cortex-M7 Thumb-2 target with hardware single-precision floating-point ABI.
 [target.thumbv7em-none-eabihf]
+# `cargo run` hands Cargo's relocatable NWA artifact to pinned nwlink 0.0.19,
+# which resolves EADK firmware imports, packages it, and installs over USB.
 runner = 'npx --yes -- nwlink@0.0.19 install-nwa'
+# External apps are partially linked relocatable objects. Retaining sections is
+# required because nwlink consumes EADK metadata/imports after Cargo's link step.
 rustflags = ["-C", "link-arg=--relocatable", "-C", "link-arg=-no-gc-sections"]
 
 [build]
+# Make the calculator target the default; host tests must specify their host target.
 target = "thumbv7em-none-eabihf"

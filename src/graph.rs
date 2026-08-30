@@ -1,0 +1,184 @@
+//! Coordinate-system policy: palette, axis visibility, and bounded 1/2/5 ticks.
+//!
+//! This module generates mathematical choices only. Camera projection and band
+//! rasterization remain in their respective layers. All tick production is fixed
+//! and capped, preventing very large/fine domains from creating hundreds of lines.
+
+use crate::eadk::Color;
+use crate::surface::Domain;
+
+/// Hard upper bound for tick positions generated on one axis.
+pub const MAX_TICKS: usize = 12;
+
+#[derive(Clone, Copy)]
+/// Central RGB565 graph palette. Keeping colors here prevents layers from
+/// silently diverging as the visual style evolves.
+pub struct GraphPalette {
+    pub background: Color,
+    pub surface: Color,
+    pub grid: Color,
+    pub x_axis: Color,
+    pub y_axis: Color,
+    pub z_axis: Color,
+    pub origin: Color,
+    pub text: Color,
+}
+
+/// Restrained default graph colors stored as 16-bit RGB565 values.
+pub const PALETTE: GraphPalette = GraphPalette {
+    background: Color { rgb565: 0xffff },
+    surface: Color { rgb565: 0x001f },
+    grid: Color { rgb565: 0xd69a },
+    x_axis: Color { rgb565: 0xb800 },
+    y_axis: Color { rgb565: 0x05a0 },
+    z_axis: Color { rgb565: 0x001f },
+    origin: Color { rgb565: 0xfd20 },
+    text: Color { rgb565: 0x630c },
+};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+/// Axes that mathematically intersect the current XY domain.
+pub struct AxisVisibility {
+    pub x: bool,
+    pub y: bool,
+    pub z: bool,
+}
+
+/// Determines which world axes can be drawn for a rectangular domain.
+pub fn axes_for_domain(domain: Domain) -> AxisVisibility {
+    AxisVisibility {
+        x: domain.contains_y_zero(),
+        y: domain.contains_x_zero(),
+        z: domain.contains_x_zero() && domain.contains_y_zero(),
+    }
+}
+
+#[derive(Clone, Copy)]
+/// Allocation-free iterator over a bounded sequence of sensible tick values.
+pub struct TickGenerator {
+    step: f32,
+    next: f32,
+    maximum: f32,
+    count: usize,
+}
+
+impl TickGenerator {
+    /// Starts ticks at the first interval multiple inside `[minimum, maximum]`.
+    pub fn new(minimum: f32, maximum: f32) -> TickGenerator {
+        let step = tick_interval(minimum, maximum);
+        let mut first_multiple = (minimum / step) as i32;
+        let mut first = first_multiple as f32 * step;
+        if first < minimum - step * 0.0001 {
+            first_multiple += 1;
+            first = first_multiple as f32 * step;
+        }
+        TickGenerator {
+            step,
+            next: first,
+            maximum,
+            count: 0,
+        }
+    }
+
+    /// Returns the next tick, canonicalizing near-zero values to exactly zero.
+    pub fn next(&mut self) -> Option<f32> {
+        if self.count >= MAX_TICKS || self.next > self.maximum + self.step * 0.0001 {
+            return None;
+        }
+        let value = self.next;
+        self.next += self.step;
+        self.count += 1;
+        Some(if value.abs() < self.step * 0.0001 {
+            0.0
+        } else {
+            value
+        })
+    }
+}
+
+/// Chooses a `1`, `2`, or `5` times power-of-ten interval targeting ~8 ticks.
+pub fn tick_interval(minimum: f32, maximum: f32) -> f32 {
+    let span = (maximum - minimum).abs();
+    if !span.is_finite() || span <= 0.0 {
+        return 1.0;
+    }
+    let desired = span / 8.0;
+    let mut magnitude = 1.0_f32;
+    while desired >= magnitude * 10.0 {
+        magnitude *= 10.0;
+    }
+    while desired < magnitude {
+        magnitude *= 0.1;
+    }
+    let normalized = desired / magnitude;
+    let factor = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    factor * magnitude
+}
+
+#[cfg(test)]
+pub fn grid_line_count(domain: Domain) -> usize {
+    let mut count = 0;
+    let mut x_ticks = TickGenerator::new(domain.x_min, domain.x_max);
+    while let Some(value) = x_ticks.next() {
+        if value != 0.0 {
+            count += 1;
+        }
+    }
+    let mut y_ticks = TickGenerator::new(domain.y_min, domain.y_max);
+    while let Some(value) = y_ticks.next() {
+        if value != 0.0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn axes_only_exist_when_their_zero_coordinate_is_in_domain() {
+        let all = axes_for_domain(Domain::new(-1.0, 1.0, -2.0, 2.0));
+        assert_eq!(
+            all,
+            AxisVisibility {
+                x: true,
+                y: true,
+                z: true
+            }
+        );
+
+        let only_x = axes_for_domain(Domain::new(1.0, 2.0, -2.0, 2.0));
+        assert_eq!(
+            only_x,
+            AxisVisibility {
+                x: true,
+                y: false,
+                z: false
+            }
+        );
+    }
+
+    #[test]
+    fn tick_intervals_follow_one_two_five_progression() {
+        assert_eq!(tick_interval(-3.1415927, 3.1415927), 1.0);
+        assert_eq!(tick_interval(-10.0, 10.0), 5.0);
+        assert_eq!(tick_interval(0.0, 1.0), 0.2);
+    }
+
+    #[test]
+    fn grid_generation_is_bounded_and_skips_axis_duplicates() {
+        let domain = Domain::new(-3.1415927, 3.1415927, -3.1415927, 3.1415927);
+        assert_eq!(grid_line_count(domain), 12);
+        assert!(grid_line_count(Domain::new(-100.0, 100.0, -100.0, 100.0)) <= MAX_TICKS * 2);
+    }
+}

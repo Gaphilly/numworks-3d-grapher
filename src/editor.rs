@@ -1,8 +1,24 @@
+//! Fixed-capacity Equation text editor and non-blocking held-key repetition.
+//!
+//! The editor stores at most 96 single-byte expression characters, matching the
+//! compiler limit. Cursor and horizontal scroll are byte indices; this is valid
+//! because the accepted calculator mapping inserts ASCII only. The edited source
+//! is intentionally independent of active compiled bytecode, so a parse failure
+//! cannot destroy the graph that was last accepted with EXE.
+//!
+//! Calculator-style characters arrive as semantic EADK events. Backspace and
+//! cursor keys additionally use raw-state timing for held-key repeat. Event polling
+//! remains bounded and controlled by `main`; Equation focus must never enter a
+//! blocking `eadk_event_get` loop because that would stall tab/focus transitions.
+
 use crate::eadk::{event, keyboard};
 use crate::expression::{CompiledExpression, ParseError, MAX_EXPRESSION_LENGTH};
 
+/// Maximum number of fixed-width characters visible in the expression field.
 pub const VISIBLE_CHARACTERS: usize = 40;
+/// Delay before a supported held editing key begins repeating.
 pub const REPEAT_INITIAL_DELAY_MS: u64 = 450;
+/// Interval between repeated Backspace/Left/Right editor actions.
 pub const REPEAT_INTERVAL_MS: u64 = 75;
 const INITIAL_EXPRESSION: &[u8] = b"sin(x) * cos(y)";
 
@@ -14,12 +30,14 @@ enum RepeatKey {
     Right,
 }
 
+/// Time/held-key state for editor-only application-level repetition.
 pub struct EditorKeyRepeat {
     key: RepeatKey,
     next_repeat_ms: u64,
 }
 
 impl EditorKeyRepeat {
+    /// Creates an idle repeat state.
     pub fn new() -> EditorKeyRepeat {
         EditorKeyRepeat {
             key: RepeatKey::None,
@@ -27,11 +45,15 @@ impl EditorKeyRepeat {
         }
     }
 
+    /// Cancels any pending initial delay or repeat sequence.
     pub fn reset(&mut self) {
         self.key = RepeatKey::None;
         self.next_repeat_ms = 0;
     }
 
+    /// Observes raw held keys and emits at most one semantic editing event.
+    /// Modifiers disable repetition; OK, Back, EXE, and character insertion are
+    /// deliberately never synthesized here.
     pub fn update(&mut self, keys: keyboard::State, now_ms: u64) -> Option<event::Event> {
         let modifier_down =
             keyboard::key_down(keys, keyboard::SHIFT) || keyboard::key_down(keys, keyboard::ALPHA);
@@ -70,6 +92,7 @@ impl EditorKeyRepeat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Intent produced by one editor event for `AppState` to resolve.
 pub enum EditorAction {
     None,
     Changed,
@@ -78,6 +101,7 @@ pub enum EditorAction {
     FocusTabs,
 }
 
+/// Editable source, cursor/scroll state, and the current parse error.
 pub struct EquationEditor {
     buffer: [u8; MAX_EXPRESSION_LENGTH],
     length: usize,
@@ -87,6 +111,7 @@ pub struct EquationEditor {
 }
 
 impl EquationEditor {
+    /// Creates an editor preloaded with `sin(x) * cos(y)`.
     pub fn new() -> EquationEditor {
         let mut editor = EquationEditor {
             buffer: [0; MAX_EXPRESSION_LENGTH],
@@ -99,6 +124,7 @@ impl EquationEditor {
         editor
     }
 
+    /// Returns the current ASCII source as UTF-8 without allocating.
     pub fn source(&self) -> &str {
         match core::str::from_utf8(&self.buffer[..self.length]) {
             Ok(source) => source,
@@ -106,20 +132,26 @@ impl EquationEditor {
         }
     }
 
+    /// Current insertion point in bytes/characters.
     pub fn cursor(&self) -> usize {
         self.cursor
     }
+    /// First visible byte in the horizontally scrolled field.
     pub fn scroll(&self) -> usize {
         self.scroll
     }
+    /// Visible source slice; UI copies it into a stack NUL-terminated EADK buffer.
     pub fn visible_bytes(&self) -> &[u8] {
         let end = core::cmp::min(self.length, self.scroll + VISIBLE_CHARACTERS);
         &self.buffer[self.scroll..end]
     }
+    /// Last compilation error, cleared by the next successful edit/compile.
     pub fn error(&self) -> Option<ParseError> {
         self.error
     }
 
+    /// Maps a semantic NumWorks event to an edit or application intent.
+    /// Function keys insert complete templates and put the cursor before `)`.
     pub fn handle_event(&mut self, value: event::Event) -> EditorAction {
         match value {
             event::LEFT => {
@@ -202,6 +234,8 @@ impl EquationEditor {
         }
     }
 
+    /// Compiles current text into `active` transactionally.
+    /// `active` is written only after a successful complete parse.
     pub fn compile_into(&mut self, active: &mut CompiledExpression) -> bool {
         match CompiledExpression::compile(self.source()) {
             Ok(compiled) => {
@@ -216,6 +250,7 @@ impl EquationEditor {
         }
     }
 
+    /// Clears an error without changing edited text or active bytecode.
     pub fn dismiss_error(&mut self) {
         self.error = None;
     }

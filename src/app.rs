@@ -1,3 +1,16 @@
+//! Application-level tab/focus state machine and dirty-state ownership.
+//!
+//! There are four user interaction contexts: Graph content, Equation content,
+//! Settings content, and the shared tab bar. Content OK moves focus to the tab
+//! bar; tab Left/Right changes selection; tab OK atomically activates content;
+//! tab Back cancels navigation. Equation Back returns to Graph without compiling,
+//! while Graph Back exits. These transitions stay in the cooperative main loop—
+//! no tab or editor owns a nested/blocking input loop.
+//!
+//! Raw keyboard state owns application transitions and continuous graph controls.
+//! Semantic EADK events own calculator-style editor characters. Keeping those
+//! responsibilities separate prevents a physical key from being applied twice.
+
 use crate::camera::Camera;
 use crate::eadk::keyboard;
 use crate::editor::EditorAction;
@@ -5,8 +18,10 @@ use crate::editor::EditorKeyRepeat;
 use crate::editor::EquationEditor;
 use crate::expression::CompiledExpression;
 use crate::input;
+use crate::surface::Domain;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Top-level application views.
 pub enum Tab {
     Graph,
     Equation,
@@ -14,6 +29,7 @@ pub enum Tab {
 }
 
 impl Tab {
+    /// Stable display index used by the three-segment header.
     pub fn index(self) -> usize {
         match self {
             Tab::Graph => 0,
@@ -40,25 +56,35 @@ impl Tab {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Whether input belongs to the selected tab's content or to tab navigation.
 pub enum Focus {
     Content,
     Tabs,
 }
 
+/// Independent invalidation domains.
+///
+/// `content` means the current tab body needs drawing. `surface` specifically
+/// means equation/domain heights must be resampled; camera changes set only
+/// `content`. `header` is isolated so camera motion never redraws static UI.
 pub struct DirtyFlags {
     pub header: bool,
     pub content: bool,
+    pub surface: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
+/// Outcome consumed by the cooperative main loop.
 pub enum UpdateResult {
     Continue,
     StateChanged,
     Exit,
 }
 
+/// Complete allocation-free application/UI state.
 pub struct AppState {
     pub camera: Camera,
+    pub domain: Domain,
     pub active_tab: Tab,
     pub selected_tab: Tab,
     pub focus: Focus,
@@ -70,15 +96,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Starts in Graph content with the default domain and equation editor text.
     pub fn new() -> AppState {
         AppState {
             camera: Camera::new(),
+            domain: Domain::DEFAULT,
             active_tab: Tab::Graph,
             selected_tab: Tab::Graph,
             focus: Focus::Content,
             dirty: DirtyFlags {
                 header: true,
                 content: true,
+                surface: true,
             },
             editor: EquationEditor::new(),
             editor_repeat: EditorKeyRepeat::new(),
@@ -87,10 +116,12 @@ impl AppState {
         }
     }
 
+    /// Raw down edges discovered during the most recent `update` call.
     pub fn pressed_keys(&self) -> keyboard::State {
         self.pressed_keys
     }
 
+    /// Atomically returns to Graph content and invalidates its viewport/header.
     pub fn show_graph(&mut self) {
         self.active_tab = Tab::Graph;
         self.selected_tab = Tab::Graph;
@@ -99,6 +130,10 @@ impl AppState {
         self.dirty.content = true;
     }
 
+    /// Applies one semantic calculator event to Equation content.
+    ///
+    /// Successful EXE replaces the active bytecode and marks surface samples
+    /// dirty. Failed compilation leaves the active bytecode untouched.
     pub fn handle_editor_event(
         &mut self,
         event: crate::eadk::event::Event,
@@ -112,6 +147,7 @@ impl AppState {
             }
             EditorAction::Submit => {
                 if self.editor.compile_into(active_expression) {
+                    self.dirty.surface = true;
                     self.show_graph();
                     UpdateResult::StateChanged
                 } else {
@@ -134,6 +170,8 @@ impl AppState {
         }
     }
 
+    /// Generates bounded-time Backspace/Left/Right repeat events from raw held
+    /// keys without blocking the main loop.
     pub fn update_editor_repeat(
         &mut self,
         keys: keyboard::State,
@@ -149,6 +187,7 @@ impl AppState {
         }
     }
 
+    /// Advances the focus/tab/camera state from one raw keyboard sample.
     pub fn update(&mut self, keys: keyboard::State) -> UpdateResult {
         let pressed = keys & !self.previous_keys;
         self.pressed_keys = pressed;
@@ -284,6 +323,7 @@ mod tests {
         let mut app = AppState::new();
         enter_equation(&mut app);
         let mut active = CompiledExpression::compile("x").expect("valid expression");
+        app.dirty.surface = false;
 
         assert!(matches!(
             app.handle_editor_event(event::EXE, &mut active),
@@ -291,6 +331,7 @@ mod tests {
         ));
         assert_eq!(app.active_tab, Tab::Graph);
         assert_eq!(app.focus, Focus::Content);
+        assert!(app.dirty.surface);
         let expected = CompiledExpression::compile("sin(x) * cos(y)")
             .expect("valid expression")
             .evaluate(0.5, 0.25);
@@ -319,5 +360,18 @@ mod tests {
             app.update(key(keyboard::BACK)),
             UpdateResult::Exit
         ));
+    }
+
+    #[test]
+    fn camera_motion_invalidates_projection_but_not_surface_samples() {
+        let mut app = AppState::new();
+        app.dirty.content = false;
+        app.dirty.surface = false;
+        assert!(matches!(
+            app.update(key(keyboard::RIGHT)),
+            UpdateResult::Continue
+        ));
+        assert!(app.dirty.content);
+        assert!(!app.dirty.surface);
     }
 }

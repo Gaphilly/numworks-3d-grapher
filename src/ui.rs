@@ -9,10 +9,10 @@
 use crate::eadk::{self, Color, Point, Rect};
 use crate::editor::{EquationEditor, VISIBLE_CHARACTERS};
 use crate::expression::ParseError;
-use crate::graph::{GraphOptions, RenderingMode};
+use crate::graph::{GraphOptions, LightingPreset, RenderingMode, SurfacePalette};
 use crate::settings::{
-    DomainField, NumberText, NumericError, SettingsItem, SettingsPage, SettingsState,
-    NUMERIC_VISIBLE_CHARACTERS,
+    AppearanceItem, DomainField, NumberText, NumericError, SettingsItem, SettingsPage,
+    SettingsState, NUMERIC_VISIBLE_CHARACTERS,
 };
 use crate::surface::{Domain, DomainError};
 
@@ -38,7 +38,7 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.2.0\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.3.0\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
@@ -232,6 +232,7 @@ pub fn draw_settings(
     match settings.page() {
         SettingsPage::Main => draw_settings_menu(settings, options, focused),
         SettingsPage::Domain => draw_domain_settings(settings, domain, focused),
+        SettingsPage::Appearance => draw_appearance_settings(settings, options, focused),
     }
     eadk::display::draw_string(
         APPLICATION_DISPLAY_VERSION,
@@ -373,8 +374,8 @@ fn draw_settings_menu(settings: &SettingsState, options: GraphOptions, focused: 
 fn setting_value(item: SettingsItem, options: GraphOptions) -> (&'static [u8], u16) {
     match item {
         SettingsItem::RenderingMode => match options.rendering_mode {
-            RenderingMode::Wireframe => (b"Wireframe\0", 228),
-            RenderingMode::Solid => (b"Solid\0", 270),
+            RenderingMode::Wireframe => (b"Wireframe >\0", 214),
+            RenderingMode::Solid => (b"Solid >\0", 256),
         },
         SettingsItem::GroundGrid => on_off(options.show_grid),
         SettingsItem::Axes => on_off(options.show_axes),
@@ -383,6 +384,87 @@ fn setting_value(item: SettingsItem, options: GraphOptions) -> (&'static [u8], u
         SettingsItem::Performance => on_off(options.show_performance),
         SettingsItem::Domain => (b"EXE >\0", 270),
         SettingsItem::ResetCamera => (b"EXE\0", 284),
+    }
+}
+
+const APPEARANCE_LABELS: [&[u8]; 2] = [b"Lighting\0", b"Surface color\0"];
+const APPEARANCE_ROW_TOP: u16 = 56;
+const APPEARANCE_ROW_HEIGHT: u16 = 34;
+
+fn draw_appearance_settings(settings: &SettingsState, options: GraphOptions, focused: bool) {
+    eadk::display::draw_string(
+        b"Solid appearance\0",
+        Point { x: 12, y: 31 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    let selected = settings.selected_appearance_item().index();
+    let mut row = 0;
+    while row < APPEARANCE_LABELS.len() {
+        let top = APPEARANCE_ROW_TOP + row as u16 * APPEARANCE_ROW_HEIGHT;
+        let is_selected = row == selected;
+        let background = if is_selected { FIELD_BACKGROUND } else { WHITE };
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 8,
+                y: top,
+                width: 304,
+                height: APPEARANCE_ROW_HEIGHT - 4,
+            },
+            background,
+        );
+        if is_selected {
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: 8,
+                    y: top,
+                    width: 3,
+                    height: APPEARANCE_ROW_HEIGHT - 4,
+                },
+                if focused { ORANGE } else { DARK_GRAY },
+            );
+        }
+        eadk::display::draw_string(
+            APPEARANCE_LABELS[row],
+            Point { x: 16, y: top + 7 },
+            false,
+            BLACK,
+            background,
+        );
+        let (value, x) = appearance_value(AppearanceItem::from_index(row as u8), options);
+        eadk::display::draw_string(
+            value,
+            Point { x, y: top + 7 },
+            false,
+            if is_selected { BLUE } else { DARK_GRAY },
+            background,
+        );
+        row += 1;
+    }
+    eadk::display::draw_string(
+        b"Left/Right: change   Back: settings\0",
+        Point { x: 12, y: 145 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+}
+
+fn appearance_value(item: AppearanceItem, options: GraphOptions) -> (&'static [u8], u16) {
+    match item {
+        AppearanceItem::Lighting => match options.lighting {
+            LightingPreset::Standard => (b"Standard\0", 242),
+            LightingPreset::Soft => (b"Soft\0", 277),
+            LightingPreset::Strong => (b"Strong\0", 263),
+        },
+        AppearanceItem::SurfaceColor => match options.surface_palette {
+            SurfacePalette::Blue => (b"Blue\0", 277),
+            SurfacePalette::Green => (b"Green\0", 270),
+            SurfacePalette::Orange => (b"Orange\0", 263),
+            SurfacePalette::Purple => (b"Purple\0", 263),
+            SurfacePalette::Gray => (b"Gray\0", 277),
+        },
     }
 }
 
@@ -606,7 +688,7 @@ mod tests {
 
     #[test]
     fn displayed_release_version_remains_manually_fixed() {
-        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.2.0\0");
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.3.0\0");
     }
 
     #[test]

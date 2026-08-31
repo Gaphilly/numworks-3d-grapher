@@ -37,12 +37,102 @@ impl RenderingMode {
     }
 }
 
+/// Bounded tone mappings applied to the cached per-triangle diffuse light.
+///
+/// These presets do not change geometry or relight the surface. They select a
+/// flash-resident RGB565 lookup table, so camera redraws retain the same cost.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LightingPreset {
+    /// Restrained contrast suitable for the default calculator display view.
+    Standard,
+    /// Higher ambient light for gentler shadows.
+    Soft,
+    /// Lower ambient light for stronger shape definition.
+    Strong,
+}
+
+impl LightingPreset {
+    pub const COUNT: usize = 3;
+
+    pub fn next(self) -> LightingPreset {
+        match self {
+            LightingPreset::Standard => LightingPreset::Soft,
+            LightingPreset::Soft => LightingPreset::Strong,
+            LightingPreset::Strong => LightingPreset::Standard,
+        }
+    }
+
+    pub fn previous(self) -> LightingPreset {
+        match self {
+            LightingPreset::Standard => LightingPreset::Strong,
+            LightingPreset::Soft => LightingPreset::Standard,
+            LightingPreset::Strong => LightingPreset::Soft,
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Solid-only base colors. Wireframe deliberately retains its released color.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SurfacePalette {
+    Blue,
+    Green,
+    Orange,
+    Purple,
+    Gray,
+}
+
+impl SurfacePalette {
+    pub const COUNT: usize = 5;
+
+    pub fn next(self) -> SurfacePalette {
+        match self {
+            SurfacePalette::Blue => SurfacePalette::Green,
+            SurfacePalette::Green => SurfacePalette::Orange,
+            SurfacePalette::Orange => SurfacePalette::Purple,
+            SurfacePalette::Purple => SurfacePalette::Gray,
+            SurfacePalette::Gray => SurfacePalette::Blue,
+        }
+    }
+
+    pub fn previous(self) -> SurfacePalette {
+        match self {
+            SurfacePalette::Blue => SurfacePalette::Gray,
+            SurfacePalette::Green => SurfacePalette::Blue,
+            SurfacePalette::Orange => SurfacePalette::Green,
+            SurfacePalette::Purple => SurfacePalette::Orange,
+            SurfacePalette::Gray => SurfacePalette::Purple,
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Solid base colors indexed by [`SurfacePalette`]. Tone mapping is performed
+/// by compile-time tables in the renderer, not by per-pixel channel arithmetic.
+pub const SOLID_SURFACE_COLORS: [u16; SurfacePalette::COUNT] = [
+    0x2d9f, // Blue: released Solid base color.
+    0x2da5, // Green.
+    0xfd20, // Orange.
+    0x881f, // Purple.
+    0x9cf3, // Gray.
+];
+
 /// Persistent graph-appearance options. These are tiny value types and changing
 /// them never requires expression recompilation or surface resampling.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GraphOptions {
     /// Height-field rasterization path.
     pub rendering_mode: RenderingMode,
+    /// Solid-only ambient/diffuse response.
+    pub lighting: LightingPreset,
+    /// Solid-only RGB565 base tint.
+    pub surface_palette: SurfacePalette,
     /// World-space grid on the XY plane; distinct from the solid surface mesh.
     pub show_grid: bool,
     /// World-space X/Y/Z axes and origin.
@@ -59,6 +149,8 @@ impl GraphOptions {
     /// Released defaults: wireframe with full coordinate context.
     pub const DEFAULT: GraphOptions = GraphOptions {
         rendering_mode: RenderingMode::Wireframe,
+        lighting: LightingPreset::Standard,
+        surface_palette: SurfacePalette::Blue,
         show_grid: true,
         show_axes: true,
         show_ticks: true,
@@ -72,8 +164,6 @@ impl GraphOptions {
 /// silently diverging as the visual style evolves.
 pub struct GraphPalette {
     pub background: Color,
-    /// Unlit base tint multiplied by the cached triangle light level.
-    pub solid_surface: Color,
     pub surface: Color,
     pub grid: Color,
     pub x_axis: Color,
@@ -86,7 +176,6 @@ pub struct GraphPalette {
 /// Restrained default graph colors stored as 16-bit RGB565 values.
 pub const PALETTE: GraphPalette = GraphPalette {
     background: Color { rgb565: 0xffff },
-    solid_surface: Color { rgb565: 0x2d9f },
     surface: Color { rgb565: 0x001f },
     grid: Color { rgb565: 0xd69a },
     x_axis: Color { rgb565: 0xb800 },

@@ -523,6 +523,41 @@ mod tests {
     }
 
     #[test]
+    fn settings_appearance_change_dirties_graph_without_resampling() {
+        let mut app = AppState::new();
+        enter_settings(&mut app);
+        let _ = app.update(key(keyboard::EXE));
+        release(&mut app);
+        assert_eq!(
+            app.settings.page(),
+            crate::settings::SettingsPage::Appearance
+        );
+
+        app.dirty.graph = false;
+        app.dirty.surface = false;
+        app.dirty.content = false;
+        let _ = app.update(key(keyboard::RIGHT));
+        assert_eq!(
+            app.graph_options.lighting,
+            crate::graph::LightingPreset::Soft
+        );
+        assert!(app.dirty.graph);
+        assert!(app.dirty.content);
+        assert!(!app.dirty.surface);
+
+        release(&mut app);
+        assert!(matches!(
+            app.update(key(keyboard::OK)),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.focus, Focus::Tabs);
+        assert_eq!(
+            app.settings.page(),
+            crate::settings::SettingsPage::Appearance
+        );
+    }
+
+    #[test]
     fn settings_camera_reset_invalidates_projection_only() {
         let mut app = AppState::new();
         app.camera.orbit(0.4, -0.2);

@@ -18,7 +18,7 @@ pub const ROWS: usize = 19;
 /// Two consistently wound triangles cover every regular-grid cell.
 pub const TRIANGLES_PER_CELL: usize = 2;
 /// Transient one-byte light/validity values for every regular-grid triangle.
-/// Zero means invalid; values 1..=255 are quantized brightness.
+/// Zero means invalid; values 1..=255 are quantized diffuse illumination.
 pub type TriangleShades = [[[u8; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
 const MIN_DOMAIN_SPAN: f32 = 0.01;
 const MAX_DOMAIN_ABSOLUTE_BOUND: f32 = 1_000.0;
@@ -133,7 +133,7 @@ pub struct Point3 {
 /// Fixed-capacity height cache for the current compiled expression and domain.
 ///
 /// Heights occupy 1,900 bytes; Solid adds 176 bytes of cached X/Y coordinates
-/// and 864 bytes of cached triangle shades. NaN/infinite evaluations remain in
+/// and 864 bytes of cached triangle light levels. NaN/infinite evaluations remain in
 /// the height cache and later invalidate every touching Solid triangle, so
 /// ordinary invalid mathematical input cannot reach rasterization or bridge a
 /// discontinuity.
@@ -246,7 +246,7 @@ impl SurfaceGrid {
         }
     }
 
-    /// Returns the cached Solid triangle validity/light values.
+    /// Returns the cached Solid triangle validity/diffuse-light values.
     ///
     /// This is rebuilt transactionally at the end of each surface resample, so
     /// camera-only redraws do not recompute 864 normals, square roots, or
@@ -260,7 +260,7 @@ impl SurfaceGrid {
         (self.z_min, self.z_max, self.has_finite_height)
     }
 
-    /// Rebuilds Solid-mode Lambert lighting and triangle validity after sampling.
+    /// Rebuilds Solid-mode Lambert diffuse light and triangle validity after sampling.
     ///
     /// Triangle zero is `(top-left, top-right, bottom-right)` and triangle one
     /// is `(top-left, bottom-right, bottom-left)`. Both wind toward world `+z`.
@@ -439,13 +439,10 @@ fn triangle_light(a: Point3, b: Point3, c: Point3, maximum_height_jump: f32) -> 
     let diffuse = ((normal_x * LIGHT_X + normal_y * LIGHT_Y + normal_z * LIGHT_Z) / length)
         .max(0.0)
         .min(1.0);
-    let brightness = 0.32 + 0.68 * diffuse;
-    let quantized = (brightness * 255.0) as u8;
-    if quantized == 0 {
-        1
-    } else {
-        quantized
-    }
+    // Zero is reserved for invalid triangles. The remaining range stores only
+    // normalized diffuse light, keeping the cache independent of the selected
+    // ambient/diffuse preset and RGB565 surface color.
+    1_u8.saturating_add((diffuse * 254.0) as u8)
 }
 
 fn point_is_finite(point: Point3) -> bool {
@@ -618,6 +615,30 @@ mod tests {
         // 1,900 height bytes plus 864 cached shades and 176 cached X/Y bytes,
         // with the range metadata/alignment required by the target ABI.
         assert_eq!(core::mem::size_of::<SurfaceGrid>(), 2_952);
+    }
+
+    #[test]
+    fn cached_diffuse_light_is_deterministic_and_bounded() {
+        let a = Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let b = Point3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.25,
+        };
+        let c = Point3 {
+            x: 1.0,
+            y: 1.0,
+            z: 0.5,
+        };
+        let first = triangle_light(a, b, c, 100.0);
+        let second = triangle_light(a, b, c, 100.0);
+        assert_eq!(first, second);
+        assert!((1..=255).contains(&first));
+        assert_eq!(triangle_light(a, b, Point3 { z: f32::NAN, ..c }, 100.0), 0);
     }
 
     #[test]

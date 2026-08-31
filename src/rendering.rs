@@ -16,7 +16,10 @@
 
 use crate::camera::{Camera, ProjectedLine, ProjectedPoint, Projector, ScreenPoint};
 use crate::eadk::{self, Color, Point, Rect};
-use crate::graph::{self, AxisVisibility, GraphOptions, RenderingMode, TickGenerator, PALETTE};
+use crate::graph::{
+    self, AxisVisibility, GraphOptions, LightingPreset, RenderingMode, SurfacePalette,
+    TickGenerator, PALETTE, SOLID_SURFACE_COLORS,
+};
 #[cfg(test)]
 use crate::surface::TRIANGLES_PER_CELL;
 use crate::surface::{Domain, Point3, SurfaceGrid, TriangleShades, COLUMNS, ROWS};
@@ -94,23 +97,44 @@ const AXIS_Z_GLYPH: [u8; 7] = [
     0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
 ];
 
-// Solid shading is computed once per triangle, but the same shade is consumed
-// once for every band that triangle can touch. Keeping the exact RGB565 result
-// in flash avoids repeating three channel multiplications/divisions in the
-// 27-band loop without adding RAM or changing the lighting appearance.
-const SHADE_COLOR_LUT: [u16; 256] = build_shade_color_lut();
+// Each Solid triangle caches a palette-neutral diffuse level. These complete
+// RGB565 tables combine that level with one ambient/diffuse preset and base
+// color entirely in flash. Selecting a new appearance therefore adds no RAM,
+// stack array, per-pixel arithmetic, or camera-time relighting.
+const LIGHTING_AMBIENT: [u8; LightingPreset::COUNT] = [66, 102, 41];
+const SURFACE_SHADE_LUTS: [[[u16; 256]; SurfacePalette::COUNT]; LightingPreset::COUNT] =
+    build_surface_shade_luts();
 
-const fn build_shade_color_lut() -> [u16; 256] {
-    let red = ((PALETTE.solid_surface.rgb565 >> 11) & 0x1f) as u32;
-    let green = ((PALETTE.solid_surface.rgb565 >> 5) & 0x3f) as u32;
-    let blue = (PALETTE.solid_surface.rgb565 & 0x1f) as u32;
+const fn build_surface_shade_luts() -> [[[u16; 256]; SurfacePalette::COUNT]; LightingPreset::COUNT]
+{
+    let mut tables = [[[0_u16; 256]; SurfacePalette::COUNT]; LightingPreset::COUNT];
+    let mut lighting = 0;
+    while lighting < LightingPreset::COUNT {
+        let mut palette = 0;
+        while palette < SurfacePalette::COUNT {
+            tables[lighting][palette] =
+                build_shade_color_lut(SOLID_SURFACE_COLORS[palette], LIGHTING_AMBIENT[lighting]);
+            palette += 1;
+        }
+        lighting += 1;
+    }
+    tables
+}
+
+const fn build_shade_color_lut(base: u16, ambient: u8) -> [u16; 256] {
+    let red = ((base >> 11) & 0x1f) as u32;
+    let green = ((base >> 5) & 0x3f) as u32;
+    let blue = (base & 0x1f) as u32;
     let mut colors = [0_u16; 256];
-    let mut shade = 0_u32;
-    while shade < colors.len() as u32 {
-        colors[shade as usize] = ((red * shade / 255) as u16) << 11
-            | ((green * shade / 255) as u16) << 5
-            | (blue * shade / 255) as u16;
-        shade += 1;
+    let mut level = 1_u32;
+    while level < colors.len() as u32 {
+        let diffuse = level - 1;
+        let ambient = ambient as u32;
+        let intensity = ambient + ((255 - ambient) * diffuse + 127) / 254;
+        colors[level as usize] = ((red * intensity / 255) as u16) << 11
+            | ((green * intensity / 255) as u16) << 5
+            | (blue * intensity / 255) as u16;
+        level += 1;
     }
     colors
 }
@@ -405,6 +429,8 @@ fn render_solid(
     // Lighting is cached at surface-sampling time. This Solid-only path avoids
     // recomputing 864 normals/square roots/divisions on camera-only redraws.
     let triangle_shades = surface.triangle_shades();
+    let shade_colors =
+        &SURFACE_SHADE_LUTS[options.lighting.index()][options.surface_palette.index()];
     let mut projected = [[SolidVertex::INVALID; COLUMNS]; ROWS];
     let projector = camera.projector();
     let (z_min, z_max, has_height) = surface.z_range();
@@ -451,7 +477,14 @@ fn render_solid(
         draw_label_backgrounds(&mut pixels, band_y, &geometry);
         draw_labels(&mut pixels, band_y, &geometry, true);
         diagnostic_marker_band(diagnostics_enabled, b'F', band_y);
-        draw_solid_surface(&mut pixels, &mut depth, band_y, &projected, triangle_shades);
+        draw_solid_surface(
+            &mut pixels,
+            &mut depth,
+            band_y,
+            &projected,
+            triangle_shades,
+            shade_colors,
+        );
         draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
         draw_origin(&mut pixels, band_y, geometry.origin);
         draw_labels(&mut pixels, band_y, &geometry, false);
@@ -1013,6 +1046,7 @@ fn draw_solid_surface(
     band_y: usize,
     projected: &[[SolidVertex; COLUMNS]; ROWS],
     triangle_shades: &TriangleShades,
+    shade_colors: &[u16; 256],
 ) {
     let mut row = 0;
     while row + 1 < ROWS {
@@ -1029,7 +1063,7 @@ fn draw_solid_surface(
                         depth,
                         band_y,
                         [first, second, third],
-                        shaded_surface_color(shade),
+                        shaded_surface_color(shade, shade_colors),
                     );
                 }
             }
@@ -1044,7 +1078,7 @@ fn draw_solid_surface(
                         depth,
                         band_y,
                         [first, second, third],
-                        shaded_surface_color(shade),
+                        shaded_surface_color(shade, shade_colors),
                     );
                 }
             }
@@ -1583,22 +1617,9 @@ fn encode_inverse_depth(depth: f32) -> u16 {
     }
 }
 
-fn shaded_surface_color(shade: u8) -> Color {
+fn shaded_surface_color(shade: u8, shade_colors: &[u16; 256]) -> Color {
     Color {
-        rgb565: SHADE_COLOR_LUT[shade as usize],
-    }
-}
-
-#[cfg(test)]
-fn shaded_surface_color_reference(shade: u8) -> Color {
-    let red = ((PALETTE.solid_surface.rgb565 >> 11) & 0x1f) as u32;
-    let green = ((PALETTE.solid_surface.rgb565 >> 5) & 0x3f) as u32;
-    let blue = (PALETTE.solid_surface.rgb565 & 0x1f) as u32;
-    let shade = shade as u32;
-    Color {
-        rgb565: (((red * shade / 255) as u16) << 11)
-            | (((green * shade / 255) as u16) << 5)
-            | (blue * shade / 255) as u16,
+        rgb565: shade_colors[shade as usize],
     }
 }
 
@@ -2519,9 +2540,14 @@ mod tests {
 
     #[test]
     fn rgb565_triangle_lighting_stays_within_the_base_channels() {
-        let darkest = shaded_surface_color(1).rgb565;
-        let brightest = shaded_surface_color(255).rgb565;
-        assert_eq!(brightest, PALETTE.solid_surface.rgb565);
+        let table =
+            &SURFACE_SHADE_LUTS[LightingPreset::Standard.index()][SurfacePalette::Blue.index()];
+        let darkest = shaded_surface_color(1, table).rgb565;
+        let brightest = shaded_surface_color(255, table).rgb565;
+        assert_eq!(
+            brightest,
+            SOLID_SURFACE_COLORS[SurfacePalette::Blue.index()]
+        );
         assert_ne!(brightest, darkest);
         assert!((darkest >> 11) <= (brightest >> 11));
         assert!(((darkest >> 5) & 0x3f) <= ((brightest >> 5) & 0x3f));
@@ -2529,26 +2555,84 @@ mod tests {
     }
 
     #[test]
-    fn shade_lookup_is_exactly_the_previous_rgb565_calculation() {
-        let mut shade = 0_u16;
-        while shade <= u8::MAX as u16 {
-            let shade_u8 = shade as u8;
-            assert_eq!(
-                shaded_surface_color(shade_u8),
-                shaded_surface_color_reference(shade_u8),
-                "shade {shade_u8}"
-            );
-            if shade_u8 == u8::MAX {
-                break;
+    fn every_surface_lut_is_bounded_and_monotonic() {
+        let mut lighting = 0;
+        while lighting < LightingPreset::COUNT {
+            let mut palette = 0;
+            while palette < SurfacePalette::COUNT {
+                let table = &SURFACE_SHADE_LUTS[lighting][palette];
+                assert_eq!(table[0], 0);
+                assert_eq!(table[255], SOLID_SURFACE_COLORS[palette]);
+                let mut level = 2;
+                while level < 256 {
+                    let previous = table[level - 1];
+                    let current = table[level];
+                    assert!((previous >> 11) <= (current >> 11));
+                    assert!(((previous >> 5) & 0x3f) <= ((current >> 5) & 0x3f));
+                    assert!((previous & 0x1f) <= (current & 0x1f));
+                    level += 1;
+                }
+                palette += 1;
             }
-            shade += 1;
+            lighting += 1;
         }
+    }
+
+    #[test]
+    fn lighting_presets_have_ordered_shadow_strength() {
+        let blue = SurfacePalette::Blue.index();
+        let strong = SURFACE_SHADE_LUTS[LightingPreset::Strong.index()][blue][1];
+        let standard = SURFACE_SHADE_LUTS[LightingPreset::Standard.index()][blue][1];
+        let soft = SURFACE_SHADE_LUTS[LightingPreset::Soft.index()][blue][1];
+        assert!((strong >> 11) <= (standard >> 11));
+        assert!((standard >> 11) <= (soft >> 11));
+        assert_ne!(strong, standard);
+        assert_ne!(standard, soft);
+    }
+
+    #[test]
+    fn palette_selection_changes_color_without_changing_depth() {
+        let vertices = [
+            solid_vertex(40, 25, 20_000),
+            solid_vertex(80, 25, 20_000),
+            solid_vertex(40, 31, 20_000),
+        ];
+        let mut blue_pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut orange_pixels = blue_pixels;
+        let mut blue_depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut orange_depth = blue_depth;
+        let level = 180;
+        draw_triangle_band(
+            &mut blue_pixels,
+            &mut blue_depth,
+            GRAPH_TOP,
+            vertices,
+            shaded_surface_color(
+                level,
+                &SURFACE_SHADE_LUTS[LightingPreset::Standard.index()][SurfacePalette::Blue.index()],
+            ),
+        );
+        draw_triangle_band(
+            &mut orange_pixels,
+            &mut orange_depth,
+            GRAPH_TOP,
+            vertices,
+            shaded_surface_color(
+                level,
+                &SURFACE_SHADE_LUTS[LightingPreset::Standard.index()]
+                    [SurfacePalette::Orange.index()],
+            ),
+        );
+        assert_eq!(blue_depth, orange_depth);
+        assert_ne!(blue_pixels, orange_pixels);
     }
 
     #[test]
     fn graph_options_remove_coordinate_geometry_without_touching_surface() {
         let hidden = GraphOptions {
             rendering_mode: RenderingMode::Wireframe,
+            lighting: LightingPreset::Standard,
+            surface_palette: SurfacePalette::Blue,
             show_grid: false,
             show_axes: false,
             show_ticks: false,

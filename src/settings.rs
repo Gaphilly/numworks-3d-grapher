@@ -16,7 +16,7 @@
 use crate::eadk::event;
 use crate::graph::GraphOptions;
 #[cfg(test)]
-use crate::graph::RenderingMode;
+use crate::graph::{LightingPreset, RenderingMode, SurfacePalette};
 use crate::surface::{Domain, DomainError};
 
 /// Maximum source bytes in one domain-bound editor.
@@ -30,12 +30,39 @@ pub const NUMERIC_VISIBLE_CHARACTERS: usize = 20;
 pub const SETTINGS_ITEM_COUNT: usize = 8;
 /// Number of editable bounds on the Domain page.
 pub const DOMAIN_FIELD_COUNT: usize = 4;
+/// Number of bounded choices on the Appearance page.
+pub const APPEARANCE_ITEM_COUNT: usize = 2;
 
 /// Settings subview currently displayed inside the Settings tab.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SettingsPage {
     Main,
     Domain,
+    Appearance,
+}
+
+/// Rows in the Solid appearance submenu.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AppearanceItem {
+    Lighting,
+    SurfaceColor,
+}
+
+impl AppearanceItem {
+    pub fn index(self) -> usize {
+        match self {
+            AppearanceItem::Lighting => 0,
+            AppearanceItem::SurfaceColor => 1,
+        }
+    }
+
+    pub fn from_index(index: u8) -> AppearanceItem {
+        if index == 0 {
+            AppearanceItem::Lighting
+        } else {
+            AppearanceItem::SurfaceColor
+        }
+    }
 }
 
 /// Rows in the compact main Settings menu.
@@ -257,6 +284,7 @@ pub struct SettingsState {
     page: SettingsPage,
     menu_index: usize,
     domain_index: usize,
+    appearance_index: u8,
     editing: bool,
     numeric: NumericEditor,
 }
@@ -268,6 +296,7 @@ impl SettingsState {
             page: SettingsPage::Main,
             menu_index: 0,
             domain_index: 0,
+            appearance_index: 0,
             editing: false,
             numeric: NumericEditor::new(),
         }
@@ -286,6 +315,11 @@ impl SettingsState {
     /// Selected bound on the Domain page.
     pub fn selected_domain_field(&self) -> DomainField {
         DomainField::from_index(self.domain_index)
+    }
+
+    /// Selected row on the bounded Solid appearance page.
+    pub fn selected_appearance_item(&self) -> AppearanceItem {
+        AppearanceItem::from_index(self.appearance_index)
     }
 
     /// Whether semantic events currently belong to the numeric field.
@@ -324,16 +358,10 @@ impl SettingsState {
         if self.editing {
             return SettingsAction::None;
         }
-        let index = if self.page == SettingsPage::Main {
-            &mut self.menu_index
-        } else {
-            &mut self.domain_index
-        };
-        if *index == 0 {
-            SettingsAction::None
-        } else {
-            *index -= 1;
-            SettingsAction::Redraw
+        match self.page {
+            SettingsPage::Main => decrement(&mut self.menu_index),
+            SettingsPage::Domain => decrement(&mut self.domain_index),
+            SettingsPage::Appearance => decrement_u8(&mut self.appearance_index),
         }
     }
 
@@ -342,16 +370,12 @@ impl SettingsState {
         if self.editing {
             return SettingsAction::None;
         }
-        let (index, count) = if self.page == SettingsPage::Main {
-            (&mut self.menu_index, SETTINGS_ITEM_COUNT)
-        } else {
-            (&mut self.domain_index, DOMAIN_FIELD_COUNT)
-        };
-        if *index + 1 >= count {
-            SettingsAction::None
-        } else {
-            *index += 1;
-            SettingsAction::Redraw
+        match self.page {
+            SettingsPage::Main => increment(&mut self.menu_index, SETTINGS_ITEM_COUNT),
+            SettingsPage::Domain => increment(&mut self.domain_index, DOMAIN_FIELD_COUNT),
+            SettingsPage::Appearance => {
+                increment_u8(&mut self.appearance_index, APPEARANCE_ITEM_COUNT as u8)
+            }
         }
     }
 
@@ -381,11 +405,15 @@ impl SettingsState {
             self.begin_domain_edit(active_domain);
             return SettingsAction::Redraw;
         }
+        if self.page == SettingsPage::Appearance {
+            return self.adjust_appearance(options, true);
+        }
 
         match self.selected_item() {
             SettingsItem::RenderingMode => {
-                options.rendering_mode = options.rendering_mode.next();
-                SettingsAction::GraphChanged
+                self.page = SettingsPage::Appearance;
+                self.appearance_index = 0;
+                SettingsAction::Redraw
             }
             SettingsItem::GroundGrid => {
                 options.show_grid = !options.show_grid;
@@ -424,7 +452,7 @@ impl SettingsState {
             self.numeric.reset();
             return SettingsAction::Redraw;
         }
-        if self.page == SettingsPage::Domain {
+        if self.page == SettingsPage::Domain || self.page == SettingsPage::Appearance {
             self.page = SettingsPage::Main;
             self.numeric.reset();
             return SettingsAction::Redraw;
@@ -473,7 +501,13 @@ impl SettingsState {
     }
 
     fn adjust(&mut self, options: &mut GraphOptions, right: bool) -> SettingsAction {
-        if self.page != SettingsPage::Main || self.editing {
+        if self.editing {
+            return SettingsAction::None;
+        }
+        if self.page == SettingsPage::Appearance {
+            return self.adjust_appearance(options, right);
+        }
+        if self.page != SettingsPage::Main {
             return SettingsAction::None;
         }
         let changed = match self.selected_item() {
@@ -502,6 +536,26 @@ impl SettingsState {
         } else {
             SettingsAction::None
         }
+    }
+
+    fn adjust_appearance(&mut self, options: &mut GraphOptions, right: bool) -> SettingsAction {
+        match self.selected_appearance_item() {
+            AppearanceItem::Lighting => {
+                options.lighting = if right {
+                    options.lighting.next()
+                } else {
+                    options.lighting.previous()
+                };
+            }
+            AppearanceItem::SurfaceColor => {
+                options.surface_palette = if right {
+                    options.surface_palette.next()
+                } else {
+                    options.surface_palette.previous()
+                };
+            }
+        }
+        SettingsAction::GraphChanged
     }
 
     fn begin_domain_edit(&mut self, active_domain: Domain) {
@@ -752,6 +806,42 @@ fn set_bool(value: &mut bool, new_value: bool) -> bool {
     }
 }
 
+fn decrement(index: &mut usize) -> SettingsAction {
+    if *index == 0 {
+        SettingsAction::None
+    } else {
+        *index -= 1;
+        SettingsAction::Redraw
+    }
+}
+
+fn increment(index: &mut usize, count: usize) -> SettingsAction {
+    if *index + 1 >= count {
+        SettingsAction::None
+    } else {
+        *index += 1;
+        SettingsAction::Redraw
+    }
+}
+
+fn decrement_u8(index: &mut u8) -> SettingsAction {
+    if *index == 0 {
+        SettingsAction::None
+    } else {
+        *index -= 1;
+        SettingsAction::Redraw
+    }
+}
+
+fn increment_u8(index: &mut u8, count: u8) -> SettingsAction {
+    if index.saturating_add(1) >= count {
+        SettingsAction::None
+    } else {
+        *index += 1;
+        SettingsAction::Redraw
+    }
+}
+
 /// Parses the deliberately small numeric grammar accepted by a bound field:
 /// optional sign, decimal mantissa, and optional signed base-ten exponent.
 fn parse_number(source: &[u8]) -> Option<f32> {
@@ -906,6 +996,55 @@ mod tests {
             SettingsAction::GraphChanged
         );
         assert!(!options.show_labels);
+    }
+
+    #[test]
+    fn appearance_page_cycles_lighting_and_color_without_resampling() {
+        let mut state = SettingsState::new();
+        let mut options = GraphOptions::DEFAULT;
+        assert_eq!(
+            state.activate(&mut options, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert_eq!(state.page(), SettingsPage::Appearance);
+        assert_eq!(state.selected_appearance_item(), AppearanceItem::Lighting);
+
+        assert_eq!(
+            state.adjust_right(&mut options),
+            SettingsAction::GraphChanged
+        );
+        assert_eq!(options.lighting, LightingPreset::Soft);
+        assert_eq!(
+            state.activate(&mut options, Domain::DEFAULT),
+            SettingsAction::GraphChanged
+        );
+        assert_eq!(options.lighting, LightingPreset::Strong);
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(
+            state.selected_appearance_item(),
+            AppearanceItem::SurfaceColor
+        );
+        assert_eq!(
+            state.adjust_left(&mut options),
+            SettingsAction::GraphChanged
+        );
+        assert_eq!(options.surface_palette, SurfacePalette::Gray);
+        assert_eq!(state.select_next(), SettingsAction::None);
+        assert_eq!(state.back(), SettingsAction::Redraw);
+        assert_eq!(state.page(), SettingsPage::Main);
+    }
+
+    #[test]
+    fn appearance_defaults_and_cycles_are_bounded() {
+        let mut options = GraphOptions::DEFAULT;
+        assert_eq!(options.lighting, LightingPreset::Standard);
+        assert_eq!(options.surface_palette, SurfacePalette::Blue);
+        options.lighting = options.lighting.previous();
+        options.surface_palette = options.surface_palette.previous();
+        assert_eq!(options.lighting, LightingPreset::Strong);
+        assert_eq!(options.surface_palette, SurfacePalette::Gray);
+        assert_eq!(options.lighting.next(), LightingPreset::Standard);
+        assert_eq!(options.surface_palette.next(), SurfacePalette::Blue);
     }
 
     #[test]

@@ -8,7 +8,8 @@ The project targets `thumbv7em-none-eabihf` (the calculator's Cortex-M7-class Th
 
 - Two surface modes: **Wireframe** and **Solid**
 - The original 25×19 wireframe renderer remains the startup default and UX/performance baseline
-- Ambient plus fixed-world-light Lambert shading for 864 regular height-field triangles
+- Cached fixed-world-light Lambert diffuse levels with Standard, Soft, and Strong tone presets
+- Five Solid palettes: Blue, Green, Orange, Purple, and Gray
 - Band-local depth testing for filled triangles
 - Configurable ground grid, axes, ticks, coordinate labels, rectangular XY domain, and camera reset
 - `f32` expression compiler/evaluator supporting constants, `x`, `y`, arithmetic, power, parentheses, unary minus, and `sin`, `cos`, `tan`, `sqrt`, and `abs`
@@ -26,7 +27,7 @@ Settings are retained only for the current application session; there is no pers
 | Mode | Behavior |
 | --- | --- |
 | Wireframe | The established low-cost row/column mesh. It has its own render path and does not allocate or calculate solid-only depth or lighting state. |
-| Solid | Two directly traversed triangles per regular-grid cell, filled with one ambient-plus-Lambert shade per triangle and ordered by a band-local depth buffer. |
+| Solid | Two directly traversed triangles per regular-grid cell, filled from a cached diffuse-light level and a selected RGB565 appearance table, then ordered by a band-local depth buffer. |
 
 The **Ground grid** setting controls the sparse world-space XY reference grid.
 
@@ -77,17 +78,21 @@ The edited source and last successfully compiled expression are separate. An inv
 
 ### Settings content
 
-The eight Settings rows are **Rendering**, **Ground grid**, **Axes**, **Ticks**, **Labels**, **Domain**, **Reset camera**, and **Performance**. Performance toggles the optional latest render-time/FPS readout; it is off by default and does not invalidate graph pixels.
+The eight Settings rows are **Rendering**, **Ground grid**, **Axes**, **Ticks**, **Labels**, **Domain**, **Reset camera**, and **Performance**. Performance toggles the optional latest render-time/FPS readout; it is off by default and does not invalidate graph pixels. On Rendering, Left/Right still switches Wireframe/Solid while EXE opens the Solid Appearance page.
 
 | Input | Action |
 | --- | --- |
 | Up / Down | Select a row |
 | Left / Right | Cycle the rendering mode or set a selected visibility option off/on |
-| EXE | Cycle/toggle a value, open Domain, or reset the camera |
+| EXE | Toggle a value, open Appearance/Domain, or reset the camera |
 | OK | Give focus to the tab bar |
 | Back | Cancel an edit, leave Domain, or return from Settings to Graph |
 
 Rendering and visibility changes only invalidate graph composition. Camera reset restores the established default camera without resampling the surface.
+
+### Appearance page
+
+Appearance provides two bounded Solid-only settings: **Lighting** (`Standard`, `Soft`, or `Strong`) and **Surface color** (`Blue`, `Green`, `Orange`, `Purple`, or `Gray`). Up/Down selects a row, Left/Right or EXE cycles its value, and Back returns to the main Settings page. These options select flash-resident lookup tables; they do not resample the surface, alter depth, or affect Wireframe.
 
 ### Domain page
 
@@ -125,7 +130,7 @@ fixed-stack f32 evaluator
 orbit-target camera transform + perspective projection
         ├── Wireframe: compact screen-point cache
         └── Solid: compact screen point + inverse-depth cache
-                    + cached triangle light/validity values
+                    + cached palette-neutral diffuse/validity values
         ↓
 regular height-field traversal + bounded axes/grid/labels
         ↓
@@ -136,7 +141,7 @@ regular height-field traversal + bounded axes/grid/labels
 27 EADK graph-viewport transfers
 ```
 
-The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Ambient-plus-Lambert lighting and triangle validity are calculated once when the surface is sampled, never during a camera-only Solid redraw.
+The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Lambert diffuse light and triangle validity are calculated once when the surface is sampled, never during a camera-only Solid redraw. Three ambient/diffuse curves and five base colors are combined into 15 compile-time RGB565 tables, keeping normal camera redraws to one indexed color lookup per triangle setup with no floating-point color work.
 
 The input/UI path is deliberately split:
 
@@ -161,6 +166,7 @@ There is no allocator and no heap-backed collection. Rendering storage is fixed-
 | RGB565 color band | 320×8×2 = 5,120 bytes | Every graph render path |
 | Solid inverse-depth band | 320×8×2 = 5,120 bytes | Solid modes only |
 | Surface cache | 1,900-byte heights + 176-byte X/Y coordinates + 864-byte triangle light/validity cache | Active graph |
+| Solid appearance tables | 15×256×2 = 7,680 bytes | Static flash/rodata; no RAM or stack allocation |
 | Wireframe projected cache | 25×19 `(i16, i16)` = 1,900 bytes | Wireframe render only |
 | Solid projected cache | 25×19 `(i16, i16, u16)` = approximately 2,850 bytes | Solid render only |
 | Expression source | 96 bytes | Equation editor state |
@@ -234,15 +240,15 @@ If a technically correct feature makes the calculator noticeably less responsive
 | `src/app.rs` | Tab/content focus state machine, graph options, domain state, and header/content/graph/surface dirty flags |
 | `src/eadk.rs` | Rust FFI layout, constants, and guarded wrappers for firmware display, keyboard, event, and timing symbols |
 | `src/editor.rs` | Fixed 96-byte Equation editor, cursor/scroll logic, calculator event mapping, and held-key repeat |
-| `src/settings.rs` | Eight-row Settings interaction, optional performance readout, and fixed 24-byte transactional domain editor |
+| `src/settings.rs` | Eight-row Settings interaction, bounded Appearance submenu, optional performance readout, and fixed 24-byte transactional domain editor |
 | `src/expression.rs` | Streaming tokenizer, shunting-yard parser, fixed postfix bytecode, and stack evaluator |
 | `src/function.rs` | `SurfaceFunction` boundary between evaluation and sampling |
-| `src/surface.rs` | Domain validation/mapping, 25×19 sampling, cached heights, discontinuity rejection, and transient triangle lighting |
+| `src/surface.rs` | Domain validation/mapping, 25×19 sampling, cached heights/coordinates/diffuse levels, and discontinuity rejection |
 | `src/camera.rs` | Orbit target/distance state, translation, perspective projection, and near-plane line clipping |
-| `src/graph.rs` | Rendering mode/options, central RGB565 palette, domain-aware axis visibility, and bounded 1/2/5 ticks |
+| `src/graph.rs` | Rendering/lighting/palette options, central coordinate colors, domain-aware axis visibility, and bounded 1/2/5 ticks |
 | `src/rendering.rs` | Wireframe/solid projected caches, coordinate/label geometry, band rasterization, inverse-depth testing, and EADK transfers |
 | `src/input.rs` | Smooth raw-key graph camera mapping |
-| `src/ui.rs` | Tab header, Equation UI, Settings/domain UI, version display, and user-facing errors |
+| `src/ui.rs` | Tab header, Equation UI, Settings/Appearance/domain UI, version display, and user-facing errors |
 | `src/math.rs` | Small `no_std` `f32` trigonometric, root, and power approximations |
 | `src/icon.png` | Application icon source converted to NWI during embedded builds |
 | `build.rs` | Host-side timestamped PNG-to-NWI conversion through nwlink |
@@ -297,7 +303,15 @@ The final command requires a connected calculator and begins the mandatory physi
 
 ## Version policy
 
-Settings displays the manually maintained version string **`v2.2.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+Settings displays the manually maintained version string **`v2.3.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+
+## v2.3.0 changes
+
+- Adds Solid lighting presets: Standard, Soft, and Strong.
+- Adds selectable Solid surface palettes: Blue, Green, Orange, Purple, and Gray.
+- Adds a compact Appearance page under Settings while preserving the existing Settings navigation model.
+- Keeps lighting cached per triangle and color selection table-based, so camera-only Solid redraws avoid new per-pixel color work.
+- Preserves the released Wireframe renderer and keeps the project version manually maintained.
 
 ## v2.2.0 changes
 

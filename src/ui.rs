@@ -38,7 +38,7 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.5.0\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.6.0\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
@@ -453,7 +453,7 @@ fn setting_value(item: SettingsItem, options: GraphOptions) -> (&'static [u8], u
     }
 }
 
-const APPEARANCE_LABELS: [&[u8]; 2] = [b"Lighting\0", b"Surface color\0"];
+const APPEARANCE_LABELS: [&[u8]; 3] = [b"Lighting\0", b"Surface color\0", b"Resolution\0"];
 const APPEARANCE_ROW_TOP: u16 = 56;
 const APPEARANCE_ROW_HEIGHT: u16 = 34;
 
@@ -510,7 +510,7 @@ fn draw_appearance_settings(settings: &SettingsState, options: GraphOptions, foc
     }
     eadk::display::draw_string(
         b"Left/Right: change   Back: settings\0",
-        Point { x: 12, y: 145 },
+        Point { x: 12, y: 180 },
         false,
         DARK_GRAY,
         WHITE,
@@ -535,6 +535,11 @@ fn appearance_value(item: AppearanceItem, options: GraphOptions) -> (&'static [u
             SurfacePalette::Yellow => (b"Yellow\0", 263),
             SurfacePalette::White => (b"White\0", 270),
             SurfacePalette::Custom => (b"Custom\0", 263),
+        },
+        AppearanceItem::Resolution => match options.resolution {
+            crate::surface::ResolutionPreset::Low => (b"Low 17x13\0", 242),
+            crate::surface::ResolutionPreset::Standard => (b"Standard 25x19\0", 214),
+            crate::surface::ResolutionPreset::High => (b"High 33x25\0", 235),
         },
     }
 }
@@ -934,7 +939,7 @@ mod tests {
 
     #[test]
     fn displayed_release_version_remains_manually_fixed() {
-        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.5.0\0");
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.6.0\0");
     }
 
     #[test]

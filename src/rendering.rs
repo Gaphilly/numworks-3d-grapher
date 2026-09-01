@@ -4,12 +4,13 @@
 //! viewport in 320×8 bands (2,560 pixels / 5,120 bytes), producing exactly 27
 //! display transfers without a 153,600-byte full-screen framebuffer or depth
 //! buffer. Solid modes add only a same-sized 16-bit depth band; they never
-//! allocate a full-screen color or depth buffer. The regular 25×19 height field
-//! is traversed directly as 864 triangles rather than expanded into a mesh.
+//! allocate a full-screen color or depth buffer. The selected fixed 17×13,
+//! 25×19, or 33×25 height field is traversed directly as active regular-grid
+//! triangles rather than expanded into a mesh.
 //!
 //! Composition order is deliberately repeated inside every band: clear, grid,
-//! axes, label backgrounds, numeric glyphs, surface, optional visible surface
-//! grid, ticks/origin, axis glyphs, then push. Graph labels must remain in this
+//! axes, label backgrounds, numeric glyphs, surface, ticks/origin, axis glyphs,
+//! then push. Graph labels must remain in this
 //! buffer. Drawing text directly to the display between band transfers can expose
 //! stale positions or overwrite labels with later bands, reintroducing the
 //! hardware flashing bug.
@@ -20,9 +21,9 @@ use crate::graph::{
     self, AxisVisibility, GraphOptions, LightingPreset, RenderingMode, Rgb888, SurfacePalette,
     TickGenerator, PALETTE, SOLID_SURFACE_COLORS,
 };
+use crate::surface::{Domain, Point3, SurfaceGrid, TriangleShades, MAX_COLUMNS, MAX_ROWS};
 #[cfg(test)]
-use crate::surface::TRIANGLES_PER_CELL;
-use crate::surface::{Domain, Point3, SurfaceGrid, TriangleShades, COLUMNS, ROWS};
+use crate::surface::{COLUMNS, ROWS, TRIANGLES_PER_CELL};
 
 const SCREEN_WIDTH: usize = 320;
 const SCREEN_HEIGHT: usize = 240;
@@ -44,7 +45,7 @@ const DEPTH_KEY_MAX: f32 = u16::MAX as f32;
 #[cfg(test)]
 const SURFACE_GRID_DEPTH_TOLERANCE: u16 = 24;
 #[cfg(test)]
-const SURFACE_GRID_EDGE_COUNT: usize = ROWS * (COLUMNS - 1) + COLUMNS * (ROWS - 1);
+const SURFACE_GRID_EDGE_COUNT: usize = 19 * (25 - 1) + 25 * (19 - 1);
 
 const NUMERIC_GLYPHS: [[u8; 7]; 13] = [
     [
@@ -285,7 +286,7 @@ struct WorldGeometry {
     origin: Option<ScreenPoint>,
 }
 
-/// Compact projected sample used only by solid modes. A zero reciprocal-depth
+/// Compact projected sample used by the shared projection scratch. A zero reciprocal-depth
 /// key is invalid; otherwise larger keys are nearer to the camera. Keeping the
 /// key quantized avoids another 1,900-byte `f32` array.
 #[derive(Clone, Copy)]
@@ -295,7 +296,47 @@ struct SolidVertex {
     inverse_depth: u16,
 }
 
+/// One fixed-capacity camera-space scratch area shared by the mutually exclusive
+/// Wireframe and Solid render calls. The pair is the minimum exact information
+/// needed after projection: physical screen coordinates and, for Solid only,
+/// its quantized inverse depth. Surface X/Y caches cannot replace this because
+/// they are world-space and do not change with the camera.
+struct ProjectionScratch {
+    screens: [[ScreenPoint; MAX_COLUMNS]; MAX_ROWS],
+    inverse_depths: [[u16; MAX_COLUMNS]; MAX_ROWS],
+}
+
+impl ProjectionScratch {
+    #[inline]
+    fn solid_vertex(&self, row: usize, column: usize) -> SolidVertex {
+        SolidVertex {
+            screen: self.screens[row][column],
+            inverse_depth: self.inverse_depths[row][column],
+        }
+    }
+}
+
+static mut PROJECTION_SCRATCH: ProjectionScratch = ProjectionScratch {
+    // Active entries are overwritten before an immutable borrow is created, so
+    // zero initialization keeps this large fixed scratch object in `.bss`.
+    screens: [[ScreenPoint { x: 0, y: 0 }; MAX_COLUMNS]; MAX_ROWS],
+    inverse_depths: [[0; MAX_COLUMNS]; MAX_ROWS],
+};
+
+/// Grants exclusive access to the renderer-private projection scratch.
+///
+/// SAFETY: EADK calls this application through one cooperative, non-reentrant
+/// main loop. `render` never calls itself and no Rust interrupt code accesses
+/// this private static. The callback fully writes the active rectangle before
+/// reborrowing it immutably for geometry/rasterization, and returns before any
+/// later render may overwrite it. The static never escapes this module.
+#[inline(never)]
+fn with_projection_scratch<R>(callback: impl FnOnce(&mut ProjectionScratch) -> R) -> R {
+    unsafe { callback(&mut *core::ptr::addr_of_mut!(PROJECTION_SCRATCH)) }
+}
+
 impl SolidVertex {
+    #[cfg(test)]
     const INVALID: SolidVertex = SolidVertex {
         screen: ScreenPoint::INVALID,
         inverse_depth: 0,
@@ -308,18 +349,46 @@ impl SolidVertex {
 
 #[derive(Clone, Copy)]
 enum ProjectedSurface<'a> {
+    /// Test-only Standard representation retained for v2.5 regression fixtures.
+    #[cfg(test)]
     Wireframe(&'a [[ScreenPoint; COLUMNS]; ROWS]),
-    Solid(&'a [[SolidVertex; COLUMNS]; ROWS]),
+    Shared {
+        screens: &'a [[ScreenPoint; MAX_COLUMNS]; MAX_ROWS],
+        rows: usize,
+        columns: usize,
+    },
 }
 
 impl ProjectedSurface<'_> {
     fn screen(self, row: usize, column: usize) -> ScreenPoint {
-        if row >= ROWS || column >= COLUMNS {
-            return ScreenPoint::INVALID;
-        }
         match self {
-            ProjectedSurface::Wireframe(points) => points[row][column],
-            ProjectedSurface::Solid(points) => points[row][column].screen,
+            #[cfg(test)]
+            Self::Wireframe(points) => {
+                if row < ROWS && column < COLUMNS {
+                    points[row][column]
+                } else {
+                    ScreenPoint::INVALID
+                }
+            }
+            Self::Shared {
+                screens,
+                rows,
+                columns,
+            } => {
+                if row < rows && column < columns {
+                    screens[row][column]
+                } else {
+                    ScreenPoint::INVALID
+                }
+            }
+        }
+    }
+
+    fn dimensions(self) -> (usize, usize) {
+        match self {
+            #[cfg(test)]
+            Self::Wireframe(_) => (ROWS, COLUMNS),
+            Self::Shared { rows, columns, .. } => (rows, columns),
         }
     }
 }
@@ -433,59 +502,60 @@ pub fn render(
 // wireframe call must never reserve the depth/lighting storage used by solid.
 #[inline(never)]
 fn render_wireframe(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options: GraphOptions) {
-    // A sentinel-based cache is smaller than an Option-rich structure and lets
-    // both row and column wire passes reuse every projected sample.
-    let mut projected = [[ScreenPoint::INVALID; COLUMNS]; ROWS];
-    let projector = camera.projector();
-    let (z_min, z_max, has_height) = surface.z_range();
-    let mut row = 0;
-    while row < ROWS {
-        let mut column = 0;
-        while column < COLUMNS {
-            let point = surface.point(domain, column, row);
-            projected[row][column] = projector.project(point);
-            column += 1;
+    with_projection_scratch(|scratch| {
+        let projector = camera.projector();
+        let (z_min, z_max, has_height) = surface.z_range();
+        let mut row = 0;
+        while row < surface.rows() {
+            let mut column = 0;
+            while column < surface.columns() {
+                // Keep Wireframe's released projection operation exactly intact.
+                scratch.screens[row][column] =
+                    projector.project(surface.point(domain, column, row));
+                column += 1;
+            }
+            row += 1;
         }
-        row += 1;
-    }
-
-    let geometry = build_world_geometry(
-        &projector,
-        domain,
-        z_min,
-        z_max,
-        has_height,
-        ProjectedSurface::Wireframe(&projected),
-        options,
-    );
-
-    eadk::display::wait_for_vblank();
-    let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
-    let mut band_y = GRAPH_TOP;
-    while band_y < SCREEN_HEIGHT {
-        // Do not move any direct-display operation into this sequence. Each band
-        // must be a complete slice of one camera state before its single push.
-        pixels.fill(PALETTE.background);
-        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Grid);
-        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Axis);
-        draw_label_backgrounds(&mut pixels, band_y, &geometry);
-        draw_labels(&mut pixels, band_y, &geometry, true);
-        draw_wireframe_surface(&mut pixels, band_y, &projected);
-        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
-        draw_origin(&mut pixels, band_y, geometry.origin);
-        draw_labels(&mut pixels, band_y, &geometry, false);
-
-        eadk::display::push_rect(
-            Rect {
-                x: 0,
-                y: band_y as u16,
-                width: SCREEN_WIDTH as u16,
-                height: BAND_HEIGHT as u16,
-            },
-            &pixels,
+        // End the exclusive population borrow before handing the cache to any
+        // geometry or rasterization code.
+        let scratch: &ProjectionScratch = scratch;
+        let projected = ProjectedSurface::Shared {
+            screens: &scratch.screens,
+            rows: surface.rows(),
+            columns: surface.columns(),
+        };
+        let geometry = build_world_geometry(
+            &projector, domain, z_min, z_max, has_height, projected, options,
         );
-        band_y += BAND_HEIGHT;
-    }
+
+        eadk::display::wait_for_vblank();
+        let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut band_y = GRAPH_TOP;
+        while band_y < SCREEN_HEIGHT {
+            // Do not move any direct-display operation into this sequence. Each band
+            // must be a complete slice of one camera state before its single push.
+            pixels.fill(PALETTE.background);
+            draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Grid);
+            draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Axis);
+            draw_label_backgrounds(&mut pixels, band_y, &geometry);
+            draw_labels(&mut pixels, band_y, &geometry, true);
+            draw_wireframe_surface(&mut pixels, band_y, projected);
+            draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
+            draw_origin(&mut pixels, band_y, geometry.origin);
+            draw_labels(&mut pixels, band_y, &geometry, false);
+
+            eadk::display::push_rect(
+                Rect {
+                    x: 0,
+                    y: band_y as u16,
+                    width: SCREEN_WIDTH as u16,
+                    height: BAND_HEIGHT as u16,
+                },
+                &pixels,
+            );
+            band_y += BAND_HEIGHT;
+        }
+    });
 }
 
 #[inline(never)]
@@ -501,76 +571,79 @@ fn render_solid(
     // recomputing 864 normals/square roots/divisions on camera-only redraws.
     let triangle_shades = surface.triangle_shades();
     let shade_colors = surface_shade_lut(options);
-    let mut projected = [[SolidVertex::INVALID; COLUMNS]; ROWS];
-    let projector = camera.projector();
-    let (z_min, z_max, has_height) = surface.z_range();
-    let mut row = 0;
-    while row < ROWS {
-        let mut column = 0;
-        while column < COLUMNS {
-            let point = surface.solid_point(column, row);
-            if let Some(point) = projector.project_with_depth(point) {
-                let inverse_depth = encode_inverse_depth(point.depth);
-                if inverse_depth != 0 {
-                    projected[row][column] = SolidVertex {
-                        screen: point.screen,
-                        inverse_depth,
-                    };
+    with_projection_scratch(|scratch| {
+        let projector = camera.projector();
+        let (z_min, z_max, has_height) = surface.z_range();
+        let mut row = 0;
+        while row < surface.rows() {
+            let mut column = 0;
+            while column < surface.columns() {
+                scratch.screens[row][column] = ScreenPoint::INVALID;
+                scratch.inverse_depths[row][column] = 0;
+                if let Some(point) = projector.project_with_depth(surface.solid_point(column, row))
+                {
+                    let inverse_depth = encode_inverse_depth(point.depth);
+                    if inverse_depth != 0 {
+                        scratch.screens[row][column] = point.screen;
+                        scratch.inverse_depths[row][column] = inverse_depth;
+                    }
                 }
+                column += 1;
             }
-            column += 1;
+            row += 1;
         }
-        row += 1;
-    }
-
-    let geometry = build_world_geometry(
-        &projector,
-        domain,
-        z_min,
-        z_max,
-        has_height,
-        ProjectedSurface::Solid(&projected),
-        options,
-    );
-
-    eadk::display::wait_for_vblank();
-    let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
-    let mut depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
-    let mut band_y = GRAPH_TOP;
-    while band_y < SCREEN_HEIGHT {
-        // The color and depth slices describe the same eight physical rows and
-        // are both reset before composing that band from one camera state.
-        pixels.fill(PALETTE.background);
-        depth.fill(0);
-        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Grid);
-        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Axis);
-        draw_label_backgrounds(&mut pixels, band_y, &geometry);
-        draw_labels(&mut pixels, band_y, &geometry, true);
-        diagnostic_marker_band(diagnostics_enabled, b'F', band_y);
-        draw_solid_surface(
-            &mut pixels,
-            &mut depth,
-            band_y,
-            &projected,
-            triangle_shades,
-            shade_colors,
+        // No code below this point mutates the shared cache during this render.
+        let scratch: &ProjectionScratch = scratch;
+        let projected = ProjectedSurface::Shared {
+            screens: &scratch.screens,
+            rows: surface.rows(),
+            columns: surface.columns(),
+        };
+        let geometry = build_world_geometry(
+            &projector, domain, z_min, z_max, has_height, projected, options,
         );
-        draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
-        draw_origin(&mut pixels, band_y, geometry.origin);
-        draw_labels(&mut pixels, band_y, &geometry, false);
 
-        diagnostic_marker_band(diagnostics_enabled, b'D', band_y);
-        eadk::display::push_rect(
-            Rect {
-                x: 0,
-                y: band_y as u16,
-                width: SCREEN_WIDTH as u16,
-                height: BAND_HEIGHT as u16,
-            },
-            &pixels,
-        );
-        band_y += BAND_HEIGHT;
-    }
+        eadk::display::wait_for_vblank();
+        let mut pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut band_y = GRAPH_TOP;
+        while band_y < SCREEN_HEIGHT {
+            // The color and depth slices describe the same eight physical rows and
+            // are both reset before composing that band from one camera state.
+            pixels.fill(PALETTE.background);
+            depth.fill(0);
+            draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Grid);
+            draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Axis);
+            draw_label_backgrounds(&mut pixels, band_y, &geometry);
+            draw_labels(&mut pixels, band_y, &geometry, true);
+            diagnostic_marker_band(diagnostics_enabled, b'F', band_y);
+            draw_solid_surface(
+                &mut pixels,
+                &mut depth,
+                band_y,
+                scratch,
+                surface.rows(),
+                surface.columns(),
+                triangle_shades,
+                shade_colors,
+            );
+            draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
+            draw_origin(&mut pixels, band_y, geometry.origin);
+            draw_labels(&mut pixels, band_y, &geometry, false);
+
+            diagnostic_marker_band(diagnostics_enabled, b'D', band_y);
+            eadk::display::push_rect(
+                Rect {
+                    x: 0,
+                    y: band_y as u16,
+                    width: SCREEN_WIDTH as u16,
+                    height: BAND_HEIGHT as u16,
+                },
+                &pixels,
+            );
+            band_y += BAND_HEIGHT;
+        }
+    });
     diagnostic_marker(diagnostics_enabled, b"OK\0");
 }
 
@@ -1077,30 +1150,27 @@ fn add_axis_label(
     }
 }
 
-fn draw_wireframe_surface(
-    pixels: &mut [Color],
-    band_y: usize,
-    projected: &[[ScreenPoint; COLUMNS]; ROWS],
-) {
+fn draw_wireframe_surface(pixels: &mut [Color], band_y: usize, projected: ProjectedSurface<'_>) {
+    let (rows, columns) = projected.dimensions();
     let mut row = 0;
-    while row < ROWS {
+    while row < rows {
         let mut column = 0;
-        while column < COLUMNS {
-            if column + 1 < COLUMNS {
+        while column < columns {
+            if column + 1 < columns {
                 draw_line(
                     pixels,
                     band_y,
-                    projected[row][column],
-                    projected[row][column + 1],
+                    projected.screen(row, column),
+                    projected.screen(row, column + 1),
                     PALETTE.surface,
                 );
             }
-            if row + 1 < ROWS {
+            if row + 1 < rows {
                 draw_line(
                     pixels,
                     band_y,
-                    projected[row][column],
-                    projected[row + 1][column],
+                    projected.screen(row, column),
+                    projected.screen(row + 1, column),
                     PALETTE.surface,
                 );
             }
@@ -1114,19 +1184,21 @@ fn draw_solid_surface(
     pixels: &mut [Color],
     depth: &mut [u16],
     band_y: usize,
-    projected: &[[SolidVertex; COLUMNS]; ROWS],
+    projected: &ProjectionScratch,
+    rows: usize,
+    columns: usize,
     triangle_shades: &TriangleShades,
     shade_colors: &[u16; 256],
 ) {
     let mut row = 0;
-    while row + 1 < ROWS {
+    while row + 1 < rows {
         let mut column = 0;
-        while column + 1 < COLUMNS {
+        while column + 1 < columns {
             let shade = triangle_shades[row][column][0];
             if shade != 0 {
-                let first = projected[row][column];
-                let second = projected[row][column + 1];
-                let third = projected[row + 1][column + 1];
+                let first = projected.solid_vertex(row, column);
+                let second = projected.solid_vertex(row, column + 1);
+                let third = projected.solid_vertex(row + 1, column + 1);
                 if triangle_intersects_band(first, second, third, band_y) {
                     draw_triangle_band(
                         pixels,
@@ -1139,9 +1211,9 @@ fn draw_solid_surface(
             }
             let shade = triangle_shades[row][column][1];
             if shade != 0 {
-                let first = projected[row][column];
-                let second = projected[row + 1][column + 1];
-                let third = projected[row + 1][column];
+                let first = projected.solid_vertex(row, column);
+                let second = projected.solid_vertex(row + 1, column + 1);
+                let third = projected.solid_vertex(row + 1, column);
                 if triangle_intersects_band(first, second, third, band_y) {
                     draw_triangle_band(
                         pixels,
@@ -1924,11 +1996,12 @@ fn label_rects_overlap(first: LabelRect, second: LabelRect, separation: i32) -> 
 }
 
 fn surface_distance_squared(rect: LabelRect, projected_surface: ProjectedSurface<'_>) -> i32 {
+    let (rows, columns) = projected_surface.dimensions();
     let mut minimum = i32::MAX;
     let mut row = 0;
-    while row < ROWS {
+    while row < rows {
         let mut column = 0;
-        while column < COLUMNS {
+        while column < columns {
             let point = projected_surface.screen(row, column);
             if point.is_visible() {
                 let x = point.x as i32;
@@ -2382,7 +2455,8 @@ mod tests {
             core::mem::size_of::<[u16; SCREEN_WIDTH * BAND_HEIGHT]>(),
             5_120
         );
-        assert_eq!(core::mem::size_of::<TriangleShades>(), 864);
+        assert_eq!(core::mem::size_of::<TriangleShades>(), 1_536);
+        assert_eq!(core::mem::size_of::<ProjectionScratch>(), 4_950,);
         assert_eq!(encode_inverse_depth(1.0), 0);
         let near = encode_inverse_depth(SOLID_NEAR_DEPTH);
         let middle = encode_inverse_depth(8.0);
@@ -2392,6 +2466,44 @@ mod tests {
         assert!(far > 0);
         assert_eq!(encode_inverse_depth(f32::NAN), 0);
         assert_eq!(encode_inverse_depth(f32::INFINITY), 0);
+    }
+
+    #[test]
+    fn shared_projection_standard_region_matches_the_released_fixture() {
+        let mut shared = [[ScreenPoint::INVALID; MAX_COLUMNS]; MAX_ROWS];
+        let mut released = [[ScreenPoint::INVALID; COLUMNS]; ROWS];
+        let mut row = 0;
+        while row < ROWS {
+            let mut column = 0;
+            while column < COLUMNS {
+                let point = ScreenPoint {
+                    x: (column as i16) * 3 - 20,
+                    y: (row as i16) * 2 + 24,
+                };
+                shared[row][column] = point;
+                released[row][column] = point;
+                column += 1;
+            }
+            row += 1;
+        }
+
+        let legacy = ProjectedSurface::Wireframe(&released);
+        let active = ProjectedSurface::Shared {
+            screens: &shared,
+            rows: ROWS,
+            columns: COLUMNS,
+        };
+        row = 0;
+        while row < ROWS {
+            let mut column = 0;
+            while column < COLUMNS {
+                assert_eq!(active.screen(row, column), legacy.screen(row, column));
+                column += 1;
+            }
+            row += 1;
+        }
+        assert_eq!(active.screen(ROWS, 0), ScreenPoint::INVALID);
+        assert_eq!(active.screen(0, COLUMNS), ScreenPoint::INVALID);
     }
 
     #[test]
@@ -2594,7 +2706,8 @@ mod tests {
 
     #[test]
     fn solid_grid_does_not_bridge_invalid_triangle_regions() {
-        let mut shades = [[[0_u8; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
+        let mut shades: TriangleShades =
+            [[[0_u8; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1];
         assert!(!horizontal_surface_edge_is_valid(&shades, 1, 1));
         assert!(!vertical_surface_edge_is_valid(&shades, 1, 1));
 
@@ -2852,6 +2965,7 @@ mod tests {
             show_ticks: false,
             show_labels: false,
             show_performance: false,
+            resolution: crate::surface::ResolutionPreset::Standard,
         };
         let geometry = build_world_geometry(
             &Camera::new().projector(),

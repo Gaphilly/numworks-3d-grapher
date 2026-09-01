@@ -31,7 +31,7 @@ pub const SETTINGS_ITEM_COUNT: usize = 8;
 /// Number of editable bounds on the Domain page.
 pub const DOMAIN_FIELD_COUNT: usize = 4;
 /// Number of bounded choices on the Appearance page.
-pub const APPEARANCE_ITEM_COUNT: usize = 2;
+pub const APPEARANCE_ITEM_COUNT: usize = 3;
 /// Three channels plus an explicit transactional Apply row.
 pub const CUSTOM_COLOR_ITEM_COUNT: usize = 4;
 /// Coarse channel adjustment used by Left/Right outside the numeric editor.
@@ -80,6 +80,7 @@ impl CustomColorItem {
 pub enum AppearanceItem {
     Lighting,
     SurfaceColor,
+    Resolution,
 }
 
 impl AppearanceItem {
@@ -87,14 +88,15 @@ impl AppearanceItem {
         match self {
             AppearanceItem::Lighting => 0,
             AppearanceItem::SurfaceColor => 1,
+            AppearanceItem::Resolution => 2,
         }
     }
 
     pub fn from_index(index: u8) -> AppearanceItem {
-        if index == 0 {
-            AppearanceItem::Lighting
-        } else {
-            AppearanceItem::SurfaceColor
+        match index {
+            0 => AppearanceItem::Lighting,
+            1 => AppearanceItem::SurfaceColor,
+            _ => AppearanceItem::Resolution,
         }
     }
 }
@@ -211,6 +213,8 @@ pub enum SettingsAction {
     Redraw,
     /// `GraphOptions` changed; do not resample the mathematical surface.
     GraphChanged,
+    /// Sampling density changed; the current surface must be rebuilt before rendering.
+    ResolutionChanged,
     /// A fully validated domain should transactionally replace the active one.
     DomainChanged(Domain),
     /// The application should restore its established default camera.
@@ -646,6 +650,14 @@ impl SettingsState {
                 } else {
                     options.surface_palette.previous()
                 };
+            }
+            AppearanceItem::Resolution => {
+                options.resolution = if right {
+                    options.resolution.next()
+                } else {
+                    options.resolution.previous()
+                };
+                return SettingsAction::ResolutionChanged;
             }
         }
         SettingsAction::GraphChanged
@@ -1225,7 +1237,12 @@ mod tests {
             SettingsAction::GraphChanged
         );
         assert_eq!(options.surface_palette, SurfacePalette::Custom);
-        assert_eq!(state.select_next(), SettingsAction::None);
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(state.selected_appearance_item(), AppearanceItem::Resolution);
+        assert_eq!(
+            state.adjust_right(&mut options),
+            SettingsAction::ResolutionChanged
+        );
         assert_eq!(state.back(), SettingsAction::Redraw);
         assert_eq!(state.page(), SettingsPage::Main);
     }
@@ -1241,6 +1258,32 @@ mod tests {
         assert_eq!(options.surface_palette, SurfacePalette::Custom);
         assert_eq!(options.lighting.next(), LightingPreset::Standard);
         assert_eq!(options.surface_palette.next(), SurfacePalette::Blue);
+    }
+
+    #[test]
+    fn appearance_resolution_cycles_and_reports_surface_resample_action() {
+        let mut state = SettingsState::new();
+        let mut options = GraphOptions::DEFAULT;
+        assert_eq!(
+            state.activate(&mut options, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(state.selected_appearance_item(), AppearanceItem::Resolution);
+        assert_eq!(
+            state.adjust_left(&mut options),
+            SettingsAction::ResolutionChanged
+        );
+        assert_eq!(options.resolution, crate::surface::ResolutionPreset::Low);
+        assert_eq!(
+            state.adjust_right(&mut options),
+            SettingsAction::ResolutionChanged
+        );
+        assert_eq!(
+            options.resolution,
+            crate::surface::ResolutionPreset::Standard
+        );
     }
 
     #[test]

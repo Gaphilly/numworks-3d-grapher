@@ -7,7 +7,7 @@ The project targets `thumbv7em-none-eabihf` (the calculator's Cortex-M7-class Th
 ## Current features
 
 - Two surface modes: **Wireframe** and **Solid**
-- The original 25×19 wireframe renderer remains the startup default and UX/performance baseline
+- Three fixed sampling presets: Low 17×13, Standard 25×19, and High 33×25; Standard remains the startup default and released UX/performance baseline
 - Cached fixed-world-light Lambert diffuse levels with Standard, Soft, and Strong tone presets
 - Ten Solid color choices: Blue, Green, Orange, Purple, Gray, Red, Cyan, Yellow, White, and a user-editable Custom RGB color
 - Band-local depth testing for filled triangles
@@ -94,7 +94,7 @@ Rendering and visibility changes only invalidate graph composition. Camera reset
 
 ### Appearance page
 
-Appearance provides two bounded Solid-only settings: **Lighting** (`Standard`, `Soft`, or `Strong`) and **Surface color** (`Blue`, `Green`, `Orange`, `Purple`, `Gray`, `Red`, `Cyan`, `Yellow`, `White`, or `Custom`). Up/Down selects a row, Left/Right cycles its value, and Back returns to the main Settings page. EXE retains forward cycling for built-in colors and opens the Custom Color page when Custom is selected.
+Appearance provides three bounded Solid-only settings: **Lighting** (`Standard`, `Soft`, or `Strong`), **Surface color** (`Blue`, `Green`, `Orange`, `Purple`, `Gray`, `Red`, `Cyan`, `Yellow`, `White`, or `Custom`), and **Resolution** (`Low`, `Standard`, or `High`). Up/Down selects a row, Left/Right cycles its value, and Back returns to the main Settings page. EXE retains forward cycling for built-in colors and opens the Custom Color page when Custom is selected.
 
 The Custom Color page edits Red, Green, and Blue channels in `0..=255`. Left/Right adjusts the temporary channel by eight, while EXE opens the existing fixed 24-byte numeric editor for an exact value. Nothing becomes active until EXE on **Apply**; Back cancels a channel draft or the complete Custom Color draft. The page includes an RGB565 preview, uses no heap, and never starts a blocking input loop.
 
@@ -104,7 +104,15 @@ Lighting and color remain independent. Appearance changes invalidate graph compo
 
 Domain exposes `Xmin`, `Xmax`, `Ymin`, and `Ymax`. Up/Down selects a bound, EXE starts editing, and EXE again validates and applies the draft. The editor accepts digits, `.`, `+`, `-`, and scientific-notation `e` through the EE key. Left/Right moves the cursor, Shift + Left/Right moves to the start/end, Backspace deletes, Shift + Backspace clears, and Back cancels the current draft. OK moves to tab focus and also discards an active draft.
 
-Applying a bound is transactional: an invalid draft never changes or resamples the active graph. A complete domain must be finite and ordered, each X/Y span must be at least `0.01` and at most `1000`, and every absolute bound must be at most `1000`. A valid change resamples the 25×19 height cache exactly once.
+Applying a bound is transactional: an invalid draft never changes or resamples the active graph. A complete domain must be finite and ordered, each X/Y span must be at least `0.01` and at most `1000`, and every absolute bound must be at most `1000`. A valid change resamples the active fixed-resolution height cache exactly once.
+
+### Resolution
+
+Appearance also provides **Resolution**. Left/Right cycles **Low** (17×13 points,
+384 triangles), **Standard** (25×19 points, 864 triangles), and **High** (33×25
+points, 1,536 triangles). Resolution changes resample the surface; lighting and
+color changes do not. Standard preserves the original endpoint-inclusive 25×19
+sampling arithmetic. Arbitrary and adaptive resolutions are intentionally unsupported.
 
 ## Supported expression syntax
 
@@ -134,11 +142,11 @@ fixed postfix bytecode (64 instructions)
         ↓
 fixed-stack f32 evaluator
         ↓
-25×19 cached surface heights
+active 17×13 / 25×19 / 33×25 cached surface heights
         ↓
 orbit-target camera transform + perspective projection
-        ├── Wireframe: compact screen-point cache
-        └── Solid: compact screen point + inverse-depth cache
+        ├── Wireframe: shared compact screen-point scratch
+        └── Solid: the same screen-point scratch + inverse-depth scratch
                     + cached palette-neutral diffuse/validity values
         ↓
 regular height-field traversal + bounded axes/grid/labels
@@ -150,7 +158,7 @@ regular height-field traversal + bounded axes/grid/labels
 27 EADK graph-viewport transfers
 ```
 
-The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Lambert diffuse light and triangle validity are calculated once when the surface is sampled, never during a camera-only Solid redraw. Three ambient/diffuse curves and nine built-in base colors are combined into 27 compile-time RGB565 tables. Custom RGB uses one persistent 256-entry table that is regenerated only after its RGB value or lighting preset changes. Camera-only redraws reuse the selected table and retain one indexed color lookup per triangle setup with no per-pixel RGB arithmetic or floating-point color work.
+The renderer visits only the active cells directly: 16×12 / 24×18 / 32×24 cells, or 384 / 864 / 1,536 consistently wound triangles. It never constructs a general mesh, scene graph, ECS, or other graphics framework. Lambert diffuse light and triangle validity are calculated once when the surface is sampled, never during a camera-only Solid redraw. Three ambient/diffuse curves and nine built-in base colors are combined into 27 compile-time RGB565 tables. Custom RGB uses one persistent 256-entry table that is regenerated only after its RGB value or lighting preset changes. Camera-only redraws reuse the selected table and retain one indexed color lookup per triangle setup with no per-pixel RGB arithmetic or floating-point color work.
 
 The input/UI path is deliberately split:
 
@@ -174,11 +182,10 @@ There is no allocator and no heap-backed collection. Rendering storage is fixed-
 | --- | ---: | --- |
 | RGB565 color band | 320×8×2 = 5,120 bytes | Every graph render path |
 | Solid inverse-depth band | 320×8×2 = 5,120 bytes | Solid modes only |
-| Surface cache | 1,900-byte heights + 176-byte X/Y coordinates + 864-byte triangle light/validity cache | Active graph |
+| Surface cache | Maximum 33×25 capacity: 3,300-byte heights + 232-byte X/Y coordinates + 1,536-byte triangle light/validity cache | Active graph |
 | Built-in Solid appearance tables | 27×256×2 = 13,824 bytes | Static flash/rodata; no RAM or stack allocation |
 | Active Custom appearance table | 256×2 = 512 bytes, plus a 4-byte cache key | Static writable memory; never placed in `AppState` or the Solid stack frame |
-| Wireframe projected cache | 25×19 `(i16, i16)` = 1,900 bytes | Wireframe render only |
-| Solid projected cache | 25×19 `(i16, i16, u16)` = approximately 2,850 bytes | Solid render only |
+| Shared projected scratch | Maximum 33×25: screen `(i16, i16)` plus Solid-only `u16` inverse depth = 4,950 bytes | Private static RAM, one non-reentrant graph render |
 | Expression source | 96 bytes | Equation editor state |
 | Domain numeric source | 24 bytes, plus terminator/state | Settings editor state |
 | Postfix bytecode | 64 fixed instructions | Active expression |
@@ -189,11 +196,11 @@ There is no allocator and no heap-backed collection. Rendering storage is fixed-
 
 A full 320×240 RGB565 framebuffer would consume 153,600 bytes, and a full-screen 16-bit depth buffer would consume another 153,600 bytes. Both are avoided. The graph viewport is 216 pixels high below its 24-pixel header, so the renderer composes exactly 27 eight-row bands and performs one EADK rectangle transfer per band—never one firmware call per pixel.
 
-Wireframe and solid use separate render call paths. Wireframe retains its established color-band and projected-cache footprint and does not reserve the Solid-only 5,120-byte depth band or approximately 2,850-byte projected vertex array. The 1,040-byte surface cache extension is persistent so Solid camera redraws can reuse exact sampled coordinates and lighting; Wireframe does not read it.
+Wireframe and Solid retain separate render call paths. They share only a renderer-private persistent projection scratch area so High resolution does not grow the render stack. Wireframe writes and reads only screen coordinates and never consumes Solid depth data; it still avoids the Solid-only 5,120-byte depth band. The scratch is safe only under the cooperative non-reentrant render loop and is fully populated before rendering borrows it immutably.
 
 ### Stack budget
 
-The current `release-extreme` ARM disassembly confirms an approximately **20.5 KiB** application-side peak on the Solid path: the long-lived `main` frame, `render_solid`, and world-geometry construction are simultaneously live. This is a stack **risk budget**, not a formal safety guarantee. EADK firmware-call depth, interrupt nesting, and the stack range assigned to an external app are firmware/device dependent and are not exposed by the public EADK ABI. Do not increase Solid-path stack storage without repeating the ARM frame analysis and validating on real hardware.
+The current `release-extreme` ARM disassembly shows an approximately **1.4 KiB** `main` frame, a 72-byte Solid wrapper, and an approximately **11.3 KiB** Solid composition closure: about **12.8 KiB** of directly observable application frames before deeper helper/firmware calls. The maximum surface cache and projection scratch deliberately live in persistent BSS instead of these frames. This is a stack **risk budget**, not a formal safety guarantee. EADK firmware-call depth, interrupt nesting, and the stack range assigned to an external app are firmware/device dependent and are not exposed by the public EADK ABI. Do not increase Solid-path stack storage without repeating the ARM frame analysis and validating on real hardware.
 
 ## Rendering pipeline
 
@@ -215,7 +222,7 @@ Solid projection encodes normalized reciprocal camera-space depth into `u16`: ze
 
 ## Known rendering limitations
 
-- The fixed 25×19 sample grid can miss detail or a discontinuity that falls entirely between sample positions.
+- Fixed grids can miss detail or a discontinuity that falls entirely between sample positions; Low is coarser and High is denser, with the expected performance tradeoff.
 - Triangles touching a NaN/infinite sample, invalid projection, degenerate normal, or implausibly large finite height jump are omitted. The local-jump rule prevents many pole-spanning triangles but is intentionally heuristic: it can remove a legitimate very steep patch or miss an unsampled pole.
 - Auxiliary world-space lines are clipped against the near plane. Wireframe surface edges with an invalid projected endpoint are omitted, and solid triangles with any invalid projected vertex are rejected instead of being polygon-clipped, so moving the camera through the surface can create temporary holes or popping.
 - A 16-bit inverse-depth band is a deliberate memory/precision tradeoff. Host tests cover ordering, ties, extremes, and interpolation, but only hardware inspection can determine whether quantization is visually acceptable. The bounded fallback is a solid-only `u32` band, never a full-screen depth buffer.
@@ -253,7 +260,7 @@ If a technically correct feature makes the calculator noticeably less responsive
 | `src/settings.rs` | Eight-row Settings interaction, Appearance/transactional Custom RGB pages, optional performance readout, and shared fixed 24-byte numeric editor |
 | `src/expression.rs` | Streaming tokenizer, shunting-yard parser, fixed postfix bytecode, and stack evaluator |
 | `src/function.rs` | `SurfaceFunction` boundary between evaluation and sampling |
-| `src/surface.rs` | Domain validation/mapping, 25×19 sampling, cached heights/coordinates/diffuse levels, and discontinuity rejection |
+| `src/surface.rs` | Domain validation/mapping, fixed Low/Standard/High sampling, cached heights/coordinates/diffuse levels, and discontinuity rejection |
 | `src/camera.rs` | Orbit target/distance state, translation, perspective projection, and near-plane line clipping |
 | `src/graph.rs` | Rendering/lighting/palette options, central coordinate colors, domain-aware axis visibility, and bounded 1/2/5 ticks |
 | `src/rendering.rs` | Wireframe/solid projected caches, coordinate/label geometry, band rasterization, inverse-depth testing, and EADK transfers |
@@ -313,15 +320,17 @@ The final command requires a connected calculator and begins the mandatory physi
 
 ## Version policy
 
-Settings displays the manually maintained version string **`v2.5.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+Settings displays the manually maintained version string **`v2.6.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
 
-## v2.5.0 changes
+## v2.6.0 changes
 
 - Adds `e`, `floor`, `ceil`, `round`, `exp`, `ln`, `min`, `max`, explicit-base `log(base, value)`, `asin`, `acos`, and `atan` to the fixed-capacity evaluator.
 - Adds fixed-arity comma parsing with safe nested calls and structured invalid-argument errors.
 - Replaces the direct Toolbox `abs()` shortcut with a compact two-column function-template picker.
 - Preserves the released Wireframe and Solid render paths, surface layout, display-transfer strategy, and color/depth architecture.
-- Sets the manually maintained displayed/package version to 2.5.0 for this release.
+- Adds Low (17×13), Standard (25×19), and High (33×25) fixed resolution presets; Standard remains the released baseline.
+- Keeps the maximum-capacity sampled surface and projection scratch in persistent fixed storage so resolution changes do not grow the render stack.
+- Sets the manually maintained displayed/package version to 2.6.0 for this release.
 
 ## v2.4.0 changes
 

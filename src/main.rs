@@ -60,25 +60,36 @@ pub extern "C" fn main() {
     let mut app = app::AppState::new();
     // Heights are separate from the compiled bytecode and projection. Camera
     // movement therefore pays only transformation/rasterization cost.
-    let mut surface = surface::SurfaceGrid::sample(app.domain, &function);
+    surface::with_active_surface(|surface| {
+        surface.resample_with_resolution(app.domain, &function, app.graph_options.resolution);
+    });
     app.dirty.surface = false;
 
     loop {
         if app.dirty.content {
             match app.active_tab {
                 app::Tab::Graph => {
-                    if app.dirty.surface {
-                        surface.resample(app.domain, &function);
-                        app.dirty.surface = false;
-                    }
                     let render_started_ms = eadk::timing::millis();
-                    rendering::render(
-                        &app.camera,
-                        app.domain,
-                        &surface,
-                        app.graph_options,
-                        RENDER_FREEZE_DIAGNOSTICS,
-                    );
+                    surface::with_active_surface(|surface| {
+                        if app.dirty.surface {
+                            surface.resample_with_resolution(
+                                app.domain,
+                                &function,
+                                app.graph_options.resolution,
+                            );
+                            app.dirty.surface = false;
+                        }
+                        // End mutable sampling access before the renderer reads
+                        // this long-lived fixed cache for the complete frame.
+                        let surface: &surface::SurfaceGrid = surface;
+                        rendering::render(
+                            &app.camera,
+                            app.domain,
+                            surface,
+                            app.graph_options,
+                            RENDER_FREEZE_DIAGNOSTICS,
+                        );
+                    });
                     app.record_graph_render_ms(
                         eadk::timing::millis().saturating_sub(render_started_ms),
                     );

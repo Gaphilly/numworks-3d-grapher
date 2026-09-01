@@ -5,7 +5,7 @@
 //! and capped, preventing very large/fine domains from creating hundreds of lines.
 
 use crate::eadk::Color;
-use crate::surface::Domain;
+use crate::surface::{Domain, ResolutionPreset};
 
 /// Hard upper bound for tick positions generated on one axis.
 pub const MAX_TICKS: usize = 12;
@@ -197,6 +197,8 @@ pub struct GraphOptions {
     pub surface_palette: SurfacePalette,
     /// User-maintained RGB888 base used when `surface_palette` is Custom.
     pub custom_rgb: Rgb888,
+    /// Fixed surface sampling density. Standard is the released 25×19 grid.
+    pub resolution: ResolutionPreset,
     /// World-space grid on the XY plane; distinct from the solid surface mesh.
     pub show_grid: bool,
     /// World-space X/Y/Z axes and origin.
@@ -216,6 +218,7 @@ impl GraphOptions {
         lighting: LightingPreset::Standard,
         surface_palette: SurfacePalette::Blue,
         custom_rgb: Rgb888::DEFAULT_CUSTOM,
+        resolution: ResolutionPreset::Standard,
         show_grid: true,
         show_axes: true,
         show_ticks: true,
@@ -464,7 +467,7 @@ mod tests {
     #[test]
     fn graph_options_keep_the_expected_compact_layout() {
         assert_eq!(core::mem::size_of::<Rgb888>(), 3);
-        assert_eq!(core::mem::size_of::<GraphOptions>(), 11);
+        assert_eq!(core::mem::size_of::<GraphOptions>(), 12);
         assert_eq!(GraphOptions::DEFAULT.custom_rgb, Rgb888::DEFAULT_CUSTOM);
     }
 }

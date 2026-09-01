@@ -338,6 +338,12 @@ impl AppState {
                 self.dirty.graph = true;
                 UpdateResult::Continue
             }
+            SettingsAction::ResolutionChanged => {
+                self.dirty.content = true;
+                self.dirty.graph = true;
+                self.dirty.surface = true;
+                UpdateResult::Continue
+            }
             SettingsAction::DomainChanged(domain) => {
                 self.domain = domain;
                 self.dirty.content = true;
@@ -596,6 +602,26 @@ mod tests {
             app.settings.page(),
             crate::settings::SettingsPage::Appearance
         );
+    }
+
+    #[test]
+    fn resolution_change_dirties_surface_and_graph_without_navigation_resampling() {
+        let mut app = AppState::new();
+        enter_settings(&mut app);
+        let _ = app.update(key(keyboard::EXE));
+        release(&mut app);
+        settings_move_down(&mut app, 2);
+        app.dirty.graph = false;
+        app.dirty.surface = false;
+        app.dirty.content = false;
+        let _ = app.update(key(keyboard::RIGHT));
+        assert_eq!(
+            app.graph_options.resolution,
+            crate::surface::ResolutionPreset::High
+        );
+        assert!(app.dirty.graph);
+        assert!(app.dirty.surface);
+        assert!(app.dirty.content);
     }
 
     #[test]

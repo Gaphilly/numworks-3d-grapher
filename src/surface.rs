@@ -1,6 +1,6 @@
-//! Mathematical domain and fixed-resolution surface sampling.
+//! Mathematical domain and fixed-capacity surface sampling.
 //!
-//! The renderer uses a regular 25×19 grid. Heights plus the exact sampled X/Y
+//! The renderer supports a bounded set of regular grids. Heights plus the exact sampled X/Y
 //! coordinates are cached so Solid camera redraws never repeat domain divisions.
 //! Solid-only triangle lighting is rebuilt only when sampling changes, avoiding
 //! normal/square-root work while orbiting. Wireframe deliberately retains its
@@ -11,15 +11,70 @@
 use crate::function::SurfaceFunction;
 use crate::math;
 
-/// Number of samples along world `x`.
-pub const COLUMNS: usize = 25;
-/// Number of samples along world `y`.
-pub const ROWS: usize = 19;
+/// Fixed graph sampling choices. The largest capacity is allocated once; only
+/// the active rectangle is sampled and rendered.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResolutionPreset {
+    Low,
+    Standard,
+    High,
+}
+
+impl ResolutionPreset {
+    pub const fn columns(self) -> usize {
+        match self {
+            Self::Low => 17,
+            Self::Standard => 25,
+            Self::High => 33,
+        }
+    }
+
+    pub const fn rows(self) -> usize {
+        match self {
+            Self::Low => 13,
+            Self::Standard => 19,
+            Self::High => 25,
+        }
+    }
+
+    #[cfg(test)]
+    pub const fn triangle_count(self) -> usize {
+        (self.columns() - 1) * (self.rows() - 1) * TRIANGLES_PER_CELL
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Low => Self::Standard,
+            Self::Standard => Self::High,
+            Self::High => Self::Low,
+        }
+    }
+
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Low => Self::High,
+            Self::Standard => Self::Low,
+            Self::High => Self::Standard,
+        }
+    }
+}
+
+/// Released Standard dimensions, retained for v2.5 reference tests.
+#[cfg(test)]
+pub const COLUMNS: usize = ResolutionPreset::Standard.columns();
+/// Released Standard dimensions, retained for v2.5 reference tests.
+#[cfg(test)]
+pub const ROWS: usize = ResolutionPreset::Standard.rows();
+/// Maximum fixed storage dimensions; no user input can change them.
+pub const MAX_COLUMNS: usize = ResolutionPreset::High.columns();
+/// Maximum fixed storage dimensions; no user input can change them.
+pub const MAX_ROWS: usize = ResolutionPreset::High.rows();
 /// Two consistently wound triangles cover every regular-grid cell.
 pub const TRIANGLES_PER_CELL: usize = 2;
 /// Transient one-byte light/validity values for every regular-grid triangle.
 /// Zero means invalid; values 1..=255 are quantized diffuse illumination.
-pub type TriangleShades = [[[u8; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
+pub type TriangleShades = [[[u8; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1];
 const MIN_DOMAIN_SPAN: f32 = 0.01;
 const MAX_DOMAIN_ABSOLUTE_BOUND: f32 = 1_000.0;
 const MAX_DOMAIN_SPAN: f32 = 1_000.0;
@@ -132,59 +187,119 @@ pub struct Point3 {
 
 /// Fixed-capacity height cache for the current compiled expression and domain.
 ///
-/// Heights occupy 1,900 bytes; Solid adds 176 bytes of cached X/Y coordinates
-/// and 864 bytes of cached triangle light levels. NaN/infinite evaluations remain in
-/// the height cache and later invalidate every touching Solid triangle, so
-/// ordinary invalid mathematical input cannot reach rasterization or bridge a
-/// discontinuity.
+/// Capacity is sized once for the High 33×25 preset: 3,300 bytes of heights,
+/// 232 bytes of cached X/Y coordinates, and 1,536 bytes of triangle light
+/// levels. Only the active preset rectangle is sampled or traversed. NaN and
+/// infinite evaluations remain in the active height cache and later invalidate
+/// every touching Solid triangle, so ordinary invalid mathematical input cannot
+/// reach rasterization or bridge a discontinuity.
 pub struct SurfaceGrid {
-    heights: [[f32; COLUMNS]; ROWS],
-    sample_x: [f32; COLUMNS],
-    sample_y: [f32; ROWS],
+    heights: [[f32; MAX_COLUMNS]; MAX_ROWS],
+    sample_x: [f32; MAX_COLUMNS],
+    sample_y: [f32; MAX_ROWS],
     triangle_shades: TriangleShades,
+    resolution: ResolutionPreset,
     z_min: f32,
     z_max: f32,
     has_finite_height: bool,
 }
 
 impl SurfaceGrid {
+    const EMPTY: SurfaceGrid = SurfaceGrid {
+        // Startup always resamples this cache before rendering. Keeping its
+        // dormant contents zero makes the persistent maximum-capacity storage
+        // live in `.bss` rather than copying a 5 KiB initializer from flash.
+        heights: [[0.0; MAX_COLUMNS]; MAX_ROWS],
+        sample_x: [0.0; MAX_COLUMNS],
+        sample_y: [0.0; MAX_ROWS],
+        triangle_shades: [[[0; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1],
+        resolution: ResolutionPreset::Low,
+        z_min: 0.0,
+        z_max: 0.0,
+        has_finite_height: false,
+    };
+}
+
+// The sampled grid is long-lived application state, not a render-local array.
+// It is private to this module and accessed only by the cooperative firmware
+// entry loop through `with_active_surface`; no interrupt or nested render path
+// can observe or mutate it concurrently.
+static mut ACTIVE_SURFACE: SurfaceGrid = SurfaceGrid::EMPTY;
+
+/// Accesses the application's one persistent sampled surface cache.
+///
+/// SAFETY: the NumWorks app has one non-reentrant main loop. Callers complete
+/// sampling before reborrowing the grid immutably for rendering, and no Rust
+/// interrupt handler accesses this module-private static.
+pub fn with_active_surface<R>(callback: impl FnOnce(&mut SurfaceGrid) -> R) -> R {
+    unsafe { callback(&mut *core::ptr::addr_of_mut!(ACTIVE_SURFACE)) }
+}
+
+impl SurfaceGrid {
     /// Evaluates a function once at every regular-grid sample.
+    #[cfg(test)]
     pub fn sample<F: SurfaceFunction>(domain: Domain, function: &F) -> SurfaceGrid {
+        Self::sample_with_resolution(domain, function, ResolutionPreset::Standard)
+    }
+
+    /// Evaluates a function using one explicitly selected fixed grid.
+    #[cfg(test)]
+    pub fn sample_with_resolution<F: SurfaceFunction>(
+        domain: Domain,
+        function: &F,
+        resolution: ResolutionPreset,
+    ) -> SurfaceGrid {
         let mut grid = SurfaceGrid {
-            heights: [[f32::NAN; COLUMNS]; ROWS],
-            sample_x: [f32::NAN; COLUMNS],
-            sample_y: [f32::NAN; ROWS],
-            triangle_shades: [[[0; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1],
+            heights: [[f32::NAN; MAX_COLUMNS]; MAX_ROWS],
+            sample_x: [f32::NAN; MAX_COLUMNS],
+            sample_y: [f32::NAN; MAX_ROWS],
+            triangle_shades: [[[0; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1],
+            resolution,
             z_min: 0.0,
             z_max: 0.0,
             has_finite_height: false,
         };
-        grid.resample(domain, function);
+        grid.resample_with_resolution(domain, function, resolution);
         grid
     }
 
     /// Replaces all cached heights after the expression or domain changes.
+    #[cfg(test)]
     pub fn resample<F: SurfaceFunction>(&mut self, domain: Domain, function: &F) {
+        self.resample_with_resolution(domain, function, ResolutionPreset::Standard);
+    }
+
+    /// Replaces cached samples using the selected fixed grid.
+    pub fn resample_with_resolution<F: SurfaceFunction>(
+        &mut self,
+        domain: Domain,
+        function: &F,
+        resolution: ResolutionPreset,
+    ) {
+        self.resolution = resolution;
         self.z_min = 0.0;
         self.z_max = 0.0;
         self.has_finite_height = false;
 
+        let columns = self.columns();
+        let rows = self.rows();
+        self.triangle_shades = [[[0; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1];
         let mut column = 0;
-        while column < COLUMNS {
-            self.sample_x[column] = domain.sample_x(column, COLUMNS);
+        while column < columns {
+            self.sample_x[column] = domain.sample_x(column, columns);
             column += 1;
         }
         let mut row = 0;
-        while row < ROWS {
-            self.sample_y[row] = domain.sample_y(row, ROWS);
+        while row < rows {
+            self.sample_y[row] = domain.sample_y(row, rows);
             row += 1;
         }
 
         row = 0;
-        while row < ROWS {
+        while row < rows {
             let y = self.sample_y[row];
             column = 0;
-            while column < COLUMNS {
+            while column < columns {
                 let x = self.sample_x[column];
                 let z = function.evaluate(x, y);
                 self.heights[row][column] = z;
@@ -212,7 +327,7 @@ impl SurfaceGrid {
     /// Reconstructs one world point without reevaluating the expression.
     /// Out-of-range indices return a non-finite point rather than panicking.
     pub fn point(&self, domain: Domain, column: usize, row: usize) -> Point3 {
-        if row >= ROWS || column >= COLUMNS {
+        if row >= self.rows() || column >= self.columns() {
             return Point3 {
                 x: f32::NAN,
                 y: f32::NAN,
@@ -220,8 +335,8 @@ impl SurfaceGrid {
             };
         }
         Point3 {
-            x: domain.sample_x(column, COLUMNS),
-            y: domain.sample_y(row, ROWS),
+            x: domain.sample_x(column, self.columns()),
+            y: domain.sample_y(row, self.rows()),
             z: self.heights[row][column],
         }
     }
@@ -232,7 +347,7 @@ impl SurfaceGrid {
     /// sampling pass. Keeping this separate from [`Self::point`] protects the
     /// released Wireframe call path from Solid-specific optimization changes.
     pub fn solid_point(&self, column: usize, row: usize) -> Point3 {
-        if row >= ROWS || column >= COLUMNS {
+        if row >= self.rows() || column >= self.columns() {
             return Point3 {
                 x: f32::NAN,
                 y: f32::NAN,
@@ -249,10 +364,26 @@ impl SurfaceGrid {
     /// Returns the cached Solid triangle validity/diffuse-light values.
     ///
     /// This is rebuilt transactionally at the end of each surface resample, so
-    /// camera-only redraws do not recompute 864 normals, square roots, or
-    /// divisions. Wireframe never reads this cache.
+    /// camera-only redraws do not recompute up to 1,536 normals, square roots,
+    /// or divisions. Wireframe never reads this cache.
     pub fn triangle_shades(&self) -> &TriangleShades {
         &self.triangle_shades
+    }
+
+    /// Active sampling choice represented by this cache.
+    #[cfg(test)]
+    pub const fn resolution(&self) -> ResolutionPreset {
+        self.resolution
+    }
+
+    /// Active world-X sample count.
+    pub const fn columns(&self) -> usize {
+        self.resolution.columns()
+    }
+
+    /// Active world-Y sample count.
+    pub const fn rows(&self) -> usize {
+        self.resolution.rows()
     }
 
     /// Cached finite height range and whether at least one finite sample exists.
@@ -268,9 +399,9 @@ impl SurfaceGrid {
         let maximum_height_jump =
             discontinuity_limit(domain, self.z_min, self.z_max, self.has_finite_height);
         let mut row = 0;
-        while row + 1 < ROWS {
+        while row + 1 < self.rows() {
             let mut column = 0;
-            while column + 1 < COLUMNS {
+            while column + 1 < self.columns() {
                 let top_left = self.point(domain, column, row);
                 let top_right = self.point(domain, column + 1, row);
                 let bottom_left = self.point(domain, column, row + 1);
@@ -300,9 +431,9 @@ impl SurfaceGrid {
         let maximum_height_jump =
             discontinuity_limit(domain, self.z_min, self.z_max, self.has_finite_height);
         let mut row = 0;
-        while row + 1 < ROWS {
+        while row + 1 < self.rows() {
             let mut column = 0;
-            while column + 1 < COLUMNS {
+            while column + 1 < self.columns() {
                 let top_left = self.point(domain, column, row);
                 let top_right = self.point(domain, column + 1, row);
                 let bottom_left = self.point(domain, column, row + 1);
@@ -322,19 +453,33 @@ impl SurfaceGrid {
     }
 
     fn cell_reverses_sample_trend(&self, row: usize, column: usize) -> bool {
-        horizontal_edge_reverses_trend(&self.heights, row, column)
-            || horizontal_edge_reverses_trend(&self.heights, row + 1, column)
-            || vertical_edge_reverses_trend(&self.heights, row, column)
-            || vertical_edge_reverses_trend(&self.heights, row, column + 1)
+        horizontal_edge_reverses_trend(&self.heights, self.rows(), self.columns(), row, column)
+            || horizontal_edge_reverses_trend(
+                &self.heights,
+                self.rows(),
+                self.columns(),
+                row + 1,
+                column,
+            )
+            || vertical_edge_reverses_trend(&self.heights, self.rows(), self.columns(), row, column)
+            || vertical_edge_reverses_trend(
+                &self.heights,
+                self.rows(),
+                self.columns(),
+                row,
+                column + 1,
+            )
     }
 }
 
 fn horizontal_edge_reverses_trend(
-    heights: &[[f32; COLUMNS]; ROWS],
+    heights: &[[f32; MAX_COLUMNS]; MAX_ROWS],
+    rows: usize,
+    columns: usize,
     row: usize,
     column: usize,
 ) -> bool {
-    if row >= ROWS || column + 1 >= COLUMNS {
+    if row >= rows || column + 1 >= columns {
         return false;
     }
     let current = heights[row][column + 1] - heights[row][column];
@@ -343,7 +488,7 @@ fn horizontal_edge_reverses_trend(
     } else {
         None
     };
-    let next = if column + 2 < COLUMNS {
+    let next = if column + 2 < columns {
         Some(heights[row][column + 2] - heights[row][column + 1])
     } else {
         None
@@ -352,11 +497,13 @@ fn horizontal_edge_reverses_trend(
 }
 
 fn vertical_edge_reverses_trend(
-    heights: &[[f32; COLUMNS]; ROWS],
+    heights: &[[f32; MAX_COLUMNS]; MAX_ROWS],
+    rows: usize,
+    columns: usize,
     row: usize,
     column: usize,
 ) -> bool {
-    if row + 1 >= ROWS || column >= COLUMNS {
+    if row + 1 >= rows || column >= columns {
         return false;
     }
     let current = heights[row + 1][column] - heights[row][column];
@@ -365,7 +512,7 @@ fn vertical_edge_reverses_trend(
     } else {
         None
     };
-    let next = if row + 2 < ROWS {
+    let next = if row + 2 < rows {
         Some(heights[row + 2][column] - heights[row + 1][column])
     } else {
         None
@@ -548,7 +695,8 @@ mod tests {
             row += 1;
         }
 
-        let mut reference = [[[0; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1];
+        let mut reference: TriangleShades =
+            [[[0; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1];
         grid.build_triangle_shades_reference(domain, &mut reference);
         assert_eq!(*grid.triangle_shades(), reference);
     }
@@ -560,6 +708,109 @@ mod tests {
         assert_eq!(domain.sample_x(4, 5), 6.0);
         assert_eq!(domain.sample_y(0, 3), -4.0);
         assert_eq!(domain.sample_y(2, 3), 8.0);
+    }
+
+    #[test]
+    fn resolution_presets_have_exact_bounded_topology() {
+        assert_eq!(
+            (
+                ResolutionPreset::Low.columns(),
+                ResolutionPreset::Low.rows()
+            ),
+            (17, 13)
+        );
+        assert_eq!(ResolutionPreset::Low.triangle_count(), 384);
+        assert_eq!(
+            (
+                ResolutionPreset::Standard.columns(),
+                ResolutionPreset::Standard.rows()
+            ),
+            (25, 19)
+        );
+        assert_eq!(ResolutionPreset::Standard.triangle_count(), 864);
+        assert_eq!(
+            (
+                ResolutionPreset::High.columns(),
+                ResolutionPreset::High.rows()
+            ),
+            (33, 25)
+        );
+        assert_eq!(ResolutionPreset::High.triangle_count(), 1_536);
+        assert!(ResolutionPreset::High.columns() <= MAX_COLUMNS);
+        assert!(ResolutionPreset::High.rows() <= MAX_ROWS);
+    }
+
+    #[test]
+    fn every_resolution_samples_inclusive_monotonic_domain_endpoints() {
+        let domain = Domain::new(-2.5, 3.75, -4.0, 1.5);
+        for resolution in [
+            ResolutionPreset::Low,
+            ResolutionPreset::Standard,
+            ResolutionPreset::High,
+        ] {
+            let grid = SurfaceGrid::sample_with_resolution(domain, &Plane, resolution);
+            assert_eq!(grid.solid_point(0, 0).x, domain.x_min);
+            assert_eq!(grid.solid_point(0, 0).y, domain.y_min);
+            assert_eq!(
+                grid.solid_point(grid.columns() - 1, grid.rows() - 1).x,
+                domain.x_max
+            );
+            assert_eq!(
+                grid.solid_point(grid.columns() - 1, grid.rows() - 1).y,
+                domain.y_max
+            );
+            let mut column = 1;
+            while column < grid.columns() {
+                assert!(grid.solid_point(column - 1, 0).x < grid.solid_point(column, 0).x);
+                column += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn standard_coordinates_match_the_released_sampling_formula_bit_for_bit() {
+        let domain = Domain::DEFAULT;
+        let grid = SurfaceGrid::sample_with_resolution(domain, &Plane, ResolutionPreset::Standard);
+        let mut column = 0;
+        while column < COLUMNS {
+            let reference =
+                domain.x_min + (domain.x_max - domain.x_min) * column as f32 / (COLUMNS - 1) as f32;
+            assert_eq!(grid.solid_point(column, 0).x.to_bits(), reference.to_bits());
+            column += 1;
+        }
+        let mut row = 0;
+        while row < ROWS {
+            let reference =
+                domain.y_min + (domain.y_max - domain.y_min) * row as f32 / (ROWS - 1) as f32;
+            assert_eq!(grid.solid_point(0, row).y.to_bits(), reference.to_bits());
+            row += 1;
+        }
+    }
+
+    #[test]
+    fn active_triangle_range_matches_each_resolution_and_ignores_inactive_capacity() {
+        let expression = CompiledExpression::compile("sin(x) * cos(y)").expect("expression");
+        for resolution in [
+            ResolutionPreset::Low,
+            ResolutionPreset::Standard,
+            ResolutionPreset::High,
+        ] {
+            let grid =
+                SurfaceGrid::sample_with_resolution(Domain::DEFAULT, &expression, resolution);
+            let mut active = 0;
+            let mut row = 0;
+            while row + 1 < grid.rows() {
+                let mut column = 0;
+                while column + 1 < grid.columns() {
+                    active += 2;
+                    column += 1;
+                }
+                row += 1;
+            }
+            assert_eq!(active, resolution.triangle_count());
+            assert!(!grid.solid_point(grid.columns(), 0).z.is_finite());
+            assert!(!grid.solid_point(0, grid.rows()).z.is_finite());
+        }
     }
 
     #[test]
@@ -611,10 +862,10 @@ mod tests {
         let shades = triangle_shades(&grid, Domain::DEFAULT);
         assert_ne!(shades[0][0][0], 0);
         assert_ne!(shades[ROWS - 2][COLUMNS - 2][1], 0);
-        assert_eq!(core::mem::size_of::<TriangleShades>(), 864);
+        assert_eq!(core::mem::size_of::<TriangleShades>(), 1_536);
         // 1,900 height bytes plus 864 cached shades and 176 cached X/Y bytes,
         // with the range metadata/alignment required by the target ABI.
-        assert_eq!(core::mem::size_of::<SurfaceGrid>(), 2_952);
+        assert_eq!(core::mem::size_of::<SurfaceGrid>(), 5_080);
     }
 
     #[test]
@@ -694,7 +945,7 @@ mod tests {
     fn trend_reversal_rejects_both_triangles_in_the_crossing_cell() {
         let row = ROWS / 2;
         let column = COLUMNS / 2;
-        let mut heights = [[0.0_f32; COLUMNS]; ROWS];
+        let mut heights = [[0.0_f32; MAX_COLUMNS]; MAX_ROWS];
         let mut y = 0;
         while y < ROWS {
             // The central edge climbs sharply, while both adjacent edges fall.
@@ -708,15 +959,22 @@ mod tests {
         }
         let mut grid = SurfaceGrid {
             heights,
-            sample_x: [f32::NAN; COLUMNS],
-            sample_y: [f32::NAN; ROWS],
-            triangle_shades: [[[0; TRIANGLES_PER_CELL]; COLUMNS - 1]; ROWS - 1],
+            sample_x: [f32::NAN; MAX_COLUMNS],
+            sample_y: [f32::NAN; MAX_ROWS],
+            triangle_shades: [[[0; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1],
+            resolution: ResolutionPreset::Standard,
             z_min: -1.0,
             z_max: 10.0,
             has_finite_height: true,
         };
 
-        assert!(horizontal_edge_reverses_trend(&grid.heights, row, column));
+        assert!(horizontal_edge_reverses_trend(
+            &grid.heights,
+            grid.rows(),
+            grid.columns(),
+            row,
+            column,
+        ));
         assert!(grid.cell_reverses_sample_trend(row, column));
 
         grid.rebuild_triangle_shades(Domain::DEFAULT);

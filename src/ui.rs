@@ -6,15 +6,18 @@
 //! are different: they must remain bitmap glyphs inside `rendering`'s band buffer
 //! to preserve composition order and avoid stale/flashing text.
 
+use crate::app::{AppState, EquationPage};
 use crate::eadk::{self, Color, Point, Rect};
 use crate::editor::{EquationEditor, FunctionTemplate, FUNCTION_PICKER_ROWS, VISIBLE_CHARACTERS};
 use crate::expression::ParseError;
-use crate::graph::{GraphOptions, LightingPreset, RenderingMode, SurfacePalette};
+use crate::functions::{FunctionSet, FUNCTION_PAIRS, MAX_FUNCTIONS, MAX_FUNCTION_PAIRS};
+use crate::graph::{GraphOptions, LightingPreset, RenderingMode, Rgb888, SurfacePalette};
+use crate::intersections::IntersectionCache;
 use crate::settings::{
     AppearanceItem, CustomColorItem, DomainField, NumberText, NumericError, SettingsItem,
     SettingsPage, SettingsState, NUMERIC_VISIBLE_CHARACTERS,
 };
-use crate::surface::{Domain, DomainError};
+use crate::surface::{Domain, DomainError, SurfaceBank};
 
 /// Header height; the graph renderer owns the remaining 320×216 viewport.
 pub const HEADER_HEIGHT: u16 = 24;
@@ -38,7 +41,7 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.7.0\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v3.0.0\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
@@ -96,7 +99,32 @@ pub fn draw_header(active: usize, selected: usize, tabs_focused: bool) {
 
 /// Redraws the Equation content region, fixed field, cursor, help, and parse error.
 /// The stack NUL-terminated copy is required by EADK's C string ABI.
+#[cfg(test)]
 pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
+    draw_expression_editor(editor, focused, 0);
+}
+
+pub fn draw_equation(
+    app: &AppState,
+    functions: &FunctionSet,
+    intersections: &IntersectionCache,
+    surfaces: &SurfaceBank,
+    focused: bool,
+) {
+    match app.equation_page {
+        EquationPage::FunctionList => draw_function_list(app, functions, focused),
+        EquationPage::FunctionDetail => draw_function_detail(app, functions, focused),
+        EquationPage::ExpressionEditor => {
+            draw_expression_editor(&app.editor, focused, app.selected_function as usize)
+        }
+        EquationPage::CustomColor => draw_function_custom_color(app, focused),
+        EquationPage::Intersections => {
+            draw_intersection_list(app, functions, intersections, surfaces, focused)
+        }
+    }
+}
+
+fn draw_expression_editor(editor: &EquationEditor, focused: bool, function: usize) {
     clear_content();
     eadk::display::draw_string(
         b"Equation\0",
@@ -105,7 +133,19 @@ pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
         DARK_GRAY,
         WHITE,
     );
-    eadk::display::draw_string(b"f(x,y) =\0", Point { x: 12, y: 61 }, false, BLACK, WHITE);
+    let function_label = [
+        b'F',
+        b'1' + function.min(3) as u8,
+        b'(',
+        b'x',
+        b',',
+        b'y',
+        b')',
+        b' ',
+        b'=',
+        0,
+    ];
+    eadk::display::draw_string(&function_label, Point { x: 12, y: 61 }, false, BLACK, WHITE);
 
     let border = if focused { BLUE } else { DARK_GRAY };
     eadk::display::push_rect_uniform(
@@ -218,6 +258,451 @@ pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
         DARK_GRAY,
         WHITE,
     );
+}
+
+fn draw_function_list(app: &AppState, functions: &FunctionSet, focused: bool) {
+    clear_content();
+    eadk::display::draw_string(
+        b"Functions\0",
+        Point { x: 12, y: 31 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    let mut index = 0;
+    while index < MAX_FUNCTIONS {
+        let top = 52 + index as u16 * 34;
+        let selected = index == app.selected_function as usize;
+        let background = if selected { FIELD_BACKGROUND } else { WHITE };
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 8,
+                y: top,
+                width: 304,
+                height: 28,
+            },
+            background,
+        );
+        if selected {
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: 8,
+                    y: top,
+                    width: 3,
+                    height: 28,
+                },
+                if focused { ORANGE } else { DARK_GRAY },
+            );
+        }
+        let slot = &functions.slots[index];
+        let name = [b'F', b'1' + index as u8, 0];
+        eadk::display::draw_string(&name, Point { x: 16, y: top + 5 }, false, BLACK, background);
+        eadk::display::draw_string(
+            if slot.enabled { b"On\0" } else { b"Off\0" },
+            Point { x: 42, y: top + 5 },
+            false,
+            if slot.enabled { BLUE } else { DARK_GRAY },
+            background,
+        );
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 72,
+                y: top + 7,
+                width: 12,
+                height: 12,
+            },
+            function_color(slot.palette, slot.custom_rgb),
+        );
+        let mut preview = [0_u8; 31];
+        let source = slot.draft();
+        if source.is_empty() {
+            preview[..7].copy_from_slice(b"<empty>");
+        } else {
+            let mut byte = 0;
+            while byte < source.len() && byte < preview.len() - 1 {
+                preview[byte] = source[byte];
+                byte += 1;
+            }
+        }
+        eadk::display::draw_string(
+            &preview,
+            Point { x: 92, y: top + 5 },
+            false,
+            if slot.draft_matches_compiled {
+                BLACK
+            } else {
+                Color { rgb565: 0xb800 }
+            },
+            background,
+        );
+        index += 1;
+    }
+    eadk::display::draw_string(
+        b"EXE: details  Toolbox: intersections\0",
+        Point { x: 12, y: 198 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+}
+
+fn draw_function_detail(app: &AppState, functions: &FunctionSet, focused: bool) {
+    clear_content();
+    let index = app.selected_function as usize;
+    let title = [
+        b'F',
+        b'1' + index as u8,
+        b' ',
+        b's',
+        b'e',
+        b't',
+        b't',
+        b'i',
+        b'n',
+        b'g',
+        b's',
+        0,
+    ];
+    eadk::display::draw_string(&title, Point { x: 12, y: 31 }, false, DARK_GRAY, WHITE);
+    let labels: [&[u8]; 3] = [b"Enabled\0", b"Expression\0", b"Color\0"];
+    let slot = &functions.slots[index];
+    let mut row = 0;
+    while row < 3 {
+        let top = 62 + row as u16 * 38;
+        let selected = row == app.function_detail_row as usize;
+        let background = if selected { FIELD_BACKGROUND } else { WHITE };
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 8,
+                y: top,
+                width: 304,
+                height: 31,
+            },
+            background,
+        );
+        if selected {
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: 8,
+                    y: top,
+                    width: 3,
+                    height: 31,
+                },
+                if focused { ORANGE } else { DARK_GRAY },
+            );
+        }
+        eadk::display::draw_string(
+            labels[row],
+            Point { x: 16, y: top + 7 },
+            false,
+            BLACK,
+            background,
+        );
+        if row == 0 {
+            eadk::display::draw_string(
+                if slot.enabled { b"On\0" } else { b"Off\0" },
+                Point { x: 270, y: top + 7 },
+                false,
+                BLUE,
+                background,
+            );
+        } else if row == 1 {
+            eadk::display::draw_string(
+                b"EXE >\0",
+                Point { x: 260, y: top + 7 },
+                false,
+                BLUE,
+                background,
+            );
+        } else {
+            eadk::display::draw_string(
+                palette_name(slot.palette),
+                Point { x: 214, y: top + 7 },
+                false,
+                BLUE,
+                background,
+            );
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: 291,
+                    y: top + 8,
+                    width: 14,
+                    height: 14,
+                },
+                function_color(slot.palette, slot.custom_rgb),
+            );
+        }
+        row += 1;
+    }
+    if !slot.draft_matches_compiled {
+        eadk::display::draw_string(
+            b"Draft not applied\0",
+            Point { x: 12, y: 184 },
+            false,
+            Color { rgb565: 0xb800 },
+            WHITE,
+        );
+    }
+}
+
+fn draw_function_custom_color(app: &AppState, focused: bool) {
+    clear_content();
+    eadk::display::draw_string(
+        b"Custom color\0",
+        Point { x: 12, y: 31 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    let labels: [&[u8]; 4] = [b"Red\0", b"Green\0", b"Blue\0", b"Apply\0"];
+    let values = [
+        app.custom_color_draft.red,
+        app.custom_color_draft.green,
+        app.custom_color_draft.blue,
+    ];
+    let mut row = 0;
+    while row < 4 {
+        let top = 54 + row as u16 * 34;
+        let selected = row == app.custom_color_row as usize;
+        let background = if selected { FIELD_BACKGROUND } else { WHITE };
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 8,
+                y: top,
+                width: 190,
+                height: 28,
+            },
+            background,
+        );
+        if selected {
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: 8,
+                    y: top,
+                    width: 3,
+                    height: 28,
+                },
+                if focused { ORANGE } else { DARK_GRAY },
+            );
+        }
+        eadk::display::draw_string(
+            labels[row],
+            Point { x: 16, y: top + 5 },
+            false,
+            BLACK,
+            background,
+        );
+        if row < 3 {
+            if selected && app.custom_numeric_editing {
+                let mut text = [0_u8; NUMERIC_VISIBLE_CHARACTERS + 1];
+                let source = app.custom_numeric.visible_bytes();
+                let length = core::cmp::min(source.len(), text.len() - 1);
+                text[..length].copy_from_slice(&source[..length]);
+                eadk::display::draw_string(
+                    &text,
+                    Point { x: 140, y: top + 5 },
+                    false,
+                    BLUE,
+                    background,
+                );
+            } else {
+                let number = NumberText::new(values[row] as f32);
+                eadk::display::draw_string(
+                    number.as_c_string(),
+                    Point { x: 140, y: top + 5 },
+                    false,
+                    BLUE,
+                    background,
+                );
+            }
+        }
+        row += 1;
+    }
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: 230,
+            y: 70,
+            width: 60,
+            height: 60,
+        },
+        Color {
+            rgb565: app.custom_color_draft.to_rgb565(),
+        },
+    );
+    if app.custom_numeric_error {
+        eadk::display::draw_string(
+            b"Enter 0..255\0",
+            Point { x: 12, y: 198 },
+            false,
+            Color { rgb565: 0xb800 },
+            WHITE,
+        );
+    }
+}
+
+fn draw_intersection_list(
+    app: &AppState,
+    functions: &FunctionSet,
+    intersections: &IntersectionCache,
+    surfaces: &SurfaceBank,
+    focused: bool,
+) {
+    clear_content();
+    eadk::display::draw_string(
+        b"Intersections\0",
+        Point { x: 12, y: 29 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    let enabled = functions.enabled_mask();
+    let mut pair = 0;
+    while pair < MAX_FUNCTION_PAIRS {
+        let top = 49 + pair as u16 * 25;
+        let selected = pair == app.selected_pair as usize;
+        let background = if selected { FIELD_BACKGROUND } else { WHITE };
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 8,
+                y: top,
+                width: 304,
+                height: 22,
+            },
+            background,
+        );
+        if selected {
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: 8,
+                    y: top,
+                    width: 3,
+                    height: 22,
+                },
+                if focused { ORANGE } else { DARK_GRAY },
+            );
+        }
+        let members = FUNCTION_PAIRS[pair];
+        let label = [
+            b'F',
+            b'1' + members.0 as u8,
+            b'/',
+            b'F',
+            b'1' + members.1 as u8,
+            0,
+        ];
+        eadk::display::draw_string(
+            &label,
+            Point { x: 16, y: top + 2 },
+            false,
+            BLACK,
+            background,
+        );
+        let pair_enabled = enabled & (1 << members.0) != 0 && enabled & (1 << members.1) != 0;
+        let visible = intersections.visibility_mask() & (1 << pair) != 0;
+        eadk::display::draw_string(
+            if visible { b"On\0" } else { b"Off\0" },
+            Point { x: 90, y: top + 2 },
+            false,
+            BLUE,
+            background,
+        );
+        if !pair_enabled {
+            eadk::display::draw_string(
+                b"Disabled\0",
+                Point { x: 218, y: top + 2 },
+                false,
+                DARK_GRAY,
+                background,
+            );
+        } else if let Some(data) = intersections.pair(pair) {
+            if data.total() == 0 {
+                eadk::display::draw_string(
+                    b"None\0",
+                    Point { x: 270, y: top + 2 },
+                    false,
+                    DARK_GRAY,
+                    background,
+                );
+            } else {
+                let number = NumberText::new(data.total() as f32);
+                eadk::display::draw_string(
+                    number.as_c_string(),
+                    Point { x: 270, y: top + 2 },
+                    false,
+                    DARK_GRAY,
+                    background,
+                );
+                if data.truncated() {
+                    eadk::display::draw_string(
+                        b"+\0",
+                        Point { x: 301, y: top + 2 },
+                        false,
+                        DARK_GRAY,
+                        background,
+                    );
+                }
+            }
+        }
+        pair += 1;
+    }
+    let selected_members = FUNCTION_PAIRS[app.selected_pair.min(5) as usize];
+    let selected_enabled =
+        enabled & (1 << selected_members.0) != 0 && enabled & (1 << selected_members.1) != 0;
+    if selected_enabled {
+        if let Some(point) = intersections.representative(app.selected_pair as usize, surfaces) {
+            let x = NumberText::new(point.x);
+            let y = NumberText::new(point.y);
+            let z = NumberText::new(point.z);
+            eadk::display::draw_string(b"x\0", Point { x: 12, y: 204 }, false, DARK_GRAY, WHITE);
+            eadk::display::draw_string(
+                x.as_c_string(),
+                Point { x: 25, y: 204 },
+                false,
+                BLACK,
+                WHITE,
+            );
+            eadk::display::draw_string(b"y\0", Point { x: 112, y: 204 }, false, DARK_GRAY, WHITE);
+            eadk::display::draw_string(
+                y.as_c_string(),
+                Point { x: 125, y: 204 },
+                false,
+                BLACK,
+                WHITE,
+            );
+            eadk::display::draw_string(b"z\0", Point { x: 212, y: 204 }, false, DARK_GRAY, WHITE);
+            eadk::display::draw_string(
+                z.as_c_string(),
+                Point { x: 225, y: 204 },
+                false,
+                BLACK,
+                WHITE,
+            );
+        }
+    }
+}
+
+fn function_color(palette: SurfacePalette, custom: Rgb888) -> Color {
+    Color {
+        rgb565: match palette.builtin_index() {
+            Some(index) => crate::graph::SOLID_SURFACE_COLORS[index],
+            None => custom.to_rgb565(),
+        },
+    }
+}
+
+fn palette_name(palette: SurfacePalette) -> &'static [u8] {
+    match palette {
+        SurfacePalette::Blue => b"Blue\0",
+        SurfacePalette::Green => b"Green\0",
+        SurfacePalette::Orange => b"Orange\0",
+        SurfacePalette::Purple => b"Purple\0",
+        SurfacePalette::Gray => b"Gray\0",
+        SurfacePalette::Red => b"Red\0",
+        SurfacePalette::Cyan => b"Cyan\0",
+        SurfacePalette::Yellow => b"Yellow\0",
+        SurfacePalette::White => b"White\0",
+        SurfacePalette::Custom => b"Custom\0",
+    }
 }
 
 /// Draws the bounded two-column Equation Toolbox picker. It is part of the
@@ -456,12 +941,7 @@ fn setting_value(item: SettingsItem, options: GraphOptions) -> (&'static [u8], u
     }
 }
 
-const APPEARANCE_LABELS: [&[u8]; 4] = [
-    b"Lighting\0",
-    b"Surface color\0",
-    b"Resolution\0",
-    b"Auto rotate\0",
-];
+const APPEARANCE_LABELS: [&[u8]; 3] = [b"Lighting\0", b"Resolution\0", b"Auto rotate\0"];
 const APPEARANCE_ROW_TOP: u16 = 56;
 const APPEARANCE_ROW_HEIGHT: u16 = 29;
 
@@ -541,18 +1021,6 @@ fn appearance_value(
             LightingPreset::Standard => (b"Standard\0", 242),
             LightingPreset::Soft => (b"Soft\0", 277),
             LightingPreset::Strong => (b"Strong\0", 263),
-        },
-        AppearanceItem::SurfaceColor => match options.surface_palette {
-            SurfacePalette::Blue => (b"Blue\0", 277),
-            SurfacePalette::Green => (b"Green\0", 270),
-            SurfacePalette::Orange => (b"Orange\0", 263),
-            SurfacePalette::Purple => (b"Purple\0", 263),
-            SurfacePalette::Gray => (b"Gray\0", 277),
-            SurfacePalette::Red => (b"Red\0", 284),
-            SurfacePalette::Cyan => (b"Cyan\0", 277),
-            SurfacePalette::Yellow => (b"Yellow\0", 263),
-            SurfacePalette::White => (b"White\0", 270),
-            SurfacePalette::Custom => (b"Custom\0", 263),
         },
         AppearanceItem::Resolution => match options.resolution {
             crate::surface::ResolutionPreset::Low => (b"Low 17x13\0", 242),
@@ -965,7 +1433,7 @@ mod tests {
 
     #[test]
     fn displayed_release_version_remains_manually_fixed() {
-        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.7.0\0");
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v3.0.0\0");
     }
 
     #[test]

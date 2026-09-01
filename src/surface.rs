@@ -200,6 +200,7 @@ pub struct Point3 {
 /// infinite evaluations remain in the active height cache and later invalidate
 /// every touching Solid triangle, so ordinary invalid mathematical input cannot
 /// reach rasterization or bridge a discontinuity.
+#[cfg(test)]
 pub struct SurfaceGrid {
     heights: [[f32; MAX_COLUMNS]; MAX_ROWS],
     sample_x: [f32; MAX_COLUMNS],
@@ -211,6 +212,7 @@ pub struct SurfaceGrid {
     has_finite_height: bool,
 }
 
+#[cfg(test)]
 impl SurfaceGrid {
     const EMPTY: SurfaceGrid = SurfaceGrid {
         // Startup always resamples this cache before rendering. Keeping its
@@ -231,6 +233,7 @@ impl SurfaceGrid {
 // It is private to this module and accessed only by the cooperative firmware
 // entry loop through `with_active_surface`; no interrupt or nested render path
 // can observe or mutate it concurrently.
+#[cfg(test)]
 static mut ACTIVE_SURFACE: SurfaceGrid = SurfaceGrid::EMPTY;
 
 /// Accesses the application's one persistent sampled surface cache.
@@ -238,10 +241,284 @@ static mut ACTIVE_SURFACE: SurfaceGrid = SurfaceGrid::EMPTY;
 /// SAFETY: the NumWorks app has one non-reentrant main loop. Callers complete
 /// sampling before reborrowing the grid immutably for rendering, and no Rust
 /// interrupt handler accesses this module-private static.
+#[cfg(test)]
 pub fn with_active_surface<R>(callback: impl FnOnce(&mut SurfaceGrid) -> R) -> R {
     unsafe { callback(&mut *core::ptr::addr_of_mut!(ACTIVE_SURFACE)) }
 }
 
+/// One function's maximum-capacity height and triangle-light cache.
+///
+/// X/Y coordinates and the active resolution are intentionally absent: all
+/// four surfaces are sampled on the same domain grid and share that metadata.
+pub struct SurfaceSamples {
+    heights: [[f32; MAX_COLUMNS]; MAX_ROWS],
+    triangle_shades: TriangleShades,
+    z_min: f32,
+    z_max: f32,
+    has_finite_height: bool,
+}
+
+impl SurfaceSamples {
+    pub(crate) const EMPTY: Self = Self {
+        heights: [[0.0; MAX_COLUMNS]; MAX_ROWS],
+        triangle_shades: [[[0; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1],
+        z_min: 0.0,
+        z_max: 0.0,
+        has_finite_height: false,
+    };
+
+    pub fn height(&self, row: usize, column: usize) -> f32 {
+        if row < MAX_ROWS && column < MAX_COLUMNS {
+            self.heights[row][column]
+        } else {
+            f32::NAN
+        }
+    }
+
+    pub fn triangle_shades(&self) -> &TriangleShades {
+        &self.triangle_shades
+    }
+}
+
+/// Shared coordinates plus four independent sampled height fields.
+pub struct SurfaceBank {
+    sample_x: [f32; MAX_COLUMNS],
+    sample_y: [f32; MAX_ROWS],
+    surfaces: [SurfaceSamples; crate::functions::MAX_FUNCTIONS],
+    resolution: ResolutionPreset,
+    valid_surface_mask: u8,
+}
+
+impl SurfaceBank {
+    pub(crate) const EMPTY: Self = Self {
+        sample_x: [0.0; MAX_COLUMNS],
+        sample_y: [0.0; MAX_ROWS],
+        surfaces: [
+            SurfaceSamples::EMPTY,
+            SurfaceSamples::EMPTY,
+            SurfaceSamples::EMPTY,
+            SurfaceSamples::EMPTY,
+        ],
+        resolution: ResolutionPreset::Low,
+        valid_surface_mask: 0,
+    };
+
+    /// Rebuilds the one coordinate grid shared by every function.
+    pub fn prepare_coordinates(&mut self, domain: Domain, resolution: ResolutionPreset) {
+        self.resolution = resolution;
+        let mut column = 0;
+        while column < self.columns() {
+            self.sample_x[column] = domain.sample_x(column, self.columns());
+            column += 1;
+        }
+        let mut row = 0;
+        while row < self.rows() {
+            self.sample_y[row] = domain.sample_y(row, self.rows());
+            row += 1;
+        }
+        self.valid_surface_mask = 0;
+    }
+
+    /// Resamples exactly one slot using the already prepared shared grid.
+    pub fn resample_surface<F: SurfaceFunction>(&mut self, index: usize, function: &F) {
+        if index >= self.surfaces.len() {
+            return;
+        }
+        let rows = self.rows();
+        let columns = self.columns();
+        let surface = &mut self.surfaces[index];
+        surface.triangle_shades = [[[0; TRIANGLES_PER_CELL]; MAX_COLUMNS - 1]; MAX_ROWS - 1];
+        surface.z_min = 0.0;
+        surface.z_max = 0.0;
+        surface.has_finite_height = false;
+        let mut row = 0;
+        while row < rows {
+            let y = self.sample_y[row];
+            let mut column = 0;
+            while column < columns {
+                let z = function.evaluate(self.sample_x[column], y);
+                surface.heights[row][column] = z;
+                if z.is_finite() {
+                    if !surface.has_finite_height {
+                        surface.z_min = z;
+                        surface.z_max = z;
+                        surface.has_finite_height = true;
+                    } else {
+                        surface.z_min = surface.z_min.min(z);
+                        surface.z_max = surface.z_max.max(z);
+                    }
+                }
+                column += 1;
+            }
+            row += 1;
+        }
+        rebuild_sample_shades(surface, &self.sample_x, &self.sample_y, rows, columns);
+        self.valid_surface_mask |= 1 << index;
+    }
+
+    pub fn invalidate_surface(&mut self, index: usize) {
+        if index < crate::functions::MAX_FUNCTIONS {
+            self.valid_surface_mask &= !(1 << index);
+        }
+    }
+
+    pub fn valid_mask(&self) -> u8 {
+        self.valid_surface_mask
+    }
+
+    pub fn surface(&self, index: usize) -> Option<&SurfaceSamples> {
+        if index < self.surfaces.len() && self.valid_surface_mask & (1 << index) != 0 {
+            Some(&self.surfaces[index])
+        } else {
+            None
+        }
+    }
+
+    pub const fn columns(&self) -> usize {
+        self.resolution.columns()
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.resolution.rows()
+    }
+
+    pub const fn resolution(&self) -> ResolutionPreset {
+        self.resolution
+    }
+
+    pub fn x(&self, column: usize) -> f32 {
+        if column < self.columns() {
+            self.sample_x[column]
+        } else {
+            f32::NAN
+        }
+    }
+
+    pub fn y(&self, row: usize) -> f32 {
+        if row < self.rows() {
+            self.sample_y[row]
+        } else {
+            f32::NAN
+        }
+    }
+
+    pub fn point(&self, surface: usize, column: usize, row: usize) -> Point3 {
+        let z = self
+            .surface(surface)
+            .map_or(f32::NAN, |samples| samples.height(row, column));
+        Point3 {
+            x: self.x(column),
+            y: self.y(row),
+            z,
+        }
+    }
+
+    pub fn union_z_range(&self, mask: u8) -> (f32, f32, bool) {
+        let mut minimum = 0.0;
+        let mut maximum = 0.0;
+        let mut found = false;
+        let mut index = 0;
+        while index < self.surfaces.len() {
+            if mask & (1 << index) != 0 && self.valid_surface_mask & (1 << index) != 0 {
+                let surface = &self.surfaces[index];
+                if surface.has_finite_height {
+                    if !found {
+                        minimum = surface.z_min;
+                        maximum = surface.z_max;
+                        found = true;
+                    } else {
+                        minimum = minimum.min(surface.z_min);
+                        maximum = maximum.max(surface.z_max);
+                    }
+                }
+            }
+            index += 1;
+        }
+        (minimum, maximum, found)
+    }
+}
+
+static mut ACTIVE_SURFACE_BANK: SurfaceBank = SurfaceBank::EMPTY;
+
+/// Exclusively accesses persistent multi-function samples from the main loop.
+/// No reference may escape the callback or overlap a renderer invocation.
+pub fn with_surface_bank<R>(callback: impl FnOnce(&mut SurfaceBank) -> R) -> R {
+    unsafe { callback(&mut *core::ptr::addr_of_mut!(ACTIVE_SURFACE_BANK)) }
+}
+
+fn rebuild_sample_shades(
+    surface: &mut SurfaceSamples,
+    sample_x: &[f32; MAX_COLUMNS],
+    sample_y: &[f32; MAX_ROWS],
+    rows: usize,
+    columns: usize,
+) {
+    let x_span = if columns > 1 {
+        sample_x[columns - 1] - sample_x[0]
+    } else {
+        0.0
+    };
+    let y_span = if rows > 1 {
+        sample_y[rows - 1] - sample_y[0]
+    } else {
+        0.0
+    };
+    let domain = Domain::new(
+        sample_x[0],
+        sample_x[columns - 1],
+        sample_y[0],
+        sample_y[rows - 1],
+    );
+    let maximum_height_jump = discontinuity_limit(
+        domain,
+        surface.z_min,
+        surface.z_max,
+        surface.has_finite_height,
+    );
+    let _ = (x_span, y_span);
+    let mut row = 0;
+    while row + 1 < rows {
+        let mut column = 0;
+        while column + 1 < columns {
+            if horizontal_edge_reverses_trend(&surface.heights, rows, columns, row, column)
+                || horizontal_edge_reverses_trend(&surface.heights, rows, columns, row + 1, column)
+                || vertical_edge_reverses_trend(&surface.heights, rows, columns, row, column)
+                || vertical_edge_reverses_trend(&surface.heights, rows, columns, row, column + 1)
+            {
+                surface.triangle_shades[row][column] = [0; TRIANGLES_PER_CELL];
+            } else {
+                let tl = Point3 {
+                    x: sample_x[column],
+                    y: sample_y[row],
+                    z: surface.heights[row][column],
+                };
+                let tr = Point3 {
+                    x: sample_x[column + 1],
+                    y: sample_y[row],
+                    z: surface.heights[row][column + 1],
+                };
+                let bl = Point3 {
+                    x: sample_x[column],
+                    y: sample_y[row + 1],
+                    z: surface.heights[row + 1][column],
+                };
+                let br = Point3 {
+                    x: sample_x[column + 1],
+                    y: sample_y[row + 1],
+                    z: surface.heights[row + 1][column + 1],
+                };
+                surface.triangle_shades[row][column][0] =
+                    triangle_light(tl, tr, br, maximum_height_jump);
+                surface.triangle_shades[row][column][1] =
+                    triangle_light(tl, br, bl, maximum_height_jump);
+            }
+            column += 1;
+        }
+        row += 1;
+    }
+}
+
+#[cfg(test)]
 impl SurfaceGrid {
     /// Evaluates a function once at every regular-grid sample.
     #[cfg(test)]
@@ -1084,5 +1361,39 @@ mod tests {
             Domain::new(-2_000.0, 2_000.0, -1.0, 1.0).validate(),
             Err(DomainError::TooLarge)
         );
+    }
+
+    #[test]
+    fn four_surface_bank_shares_coordinates_and_is_fixed_capacity() {
+        let expressions = ["x", "y", "x+y", "x-y"];
+        let mut bank = SurfaceBank::EMPTY;
+        bank.prepare_coordinates(Domain::DEFAULT, ResolutionPreset::Ultra);
+        for (index, source) in expressions.iter().enumerate() {
+            let expression = CompiledExpression::compile(source).unwrap();
+            bank.resample_surface(index, &expression);
+        }
+        assert_eq!(bank.valid_mask(), 0b1111);
+        assert_eq!(bank.columns(), 41);
+        assert_eq!(bank.rows(), 31);
+        assert_eq!(bank.x(0).to_bits(), Domain::DEFAULT.x_min.to_bits());
+        assert_eq!(bank.x(40).to_bits(), Domain::DEFAULT.x_max.to_bits());
+        assert_eq!(bank.y(0).to_bits(), Domain::DEFAULT.y_min.to_bits());
+        assert_eq!(bank.y(30).to_bits(), Domain::DEFAULT.y_max.to_bits());
+        assert_eq!(bank.surface(0).unwrap().height(0, 0), bank.x(0));
+        assert_eq!(bank.surface(1).unwrap().height(0, 0), bank.y(0));
+        assert_eq!(core::mem::size_of::<SurfaceSamples>(), 7_496);
+        assert!(core::mem::size_of::<SurfaceBank>() <= 30_300);
+    }
+
+    #[test]
+    fn invalidating_one_surface_never_exposes_stale_inactive_geometry() {
+        let expression = CompiledExpression::compile("x+y").unwrap();
+        let mut bank = SurfaceBank::EMPTY;
+        bank.prepare_coordinates(Domain::DEFAULT, ResolutionPreset::Low);
+        bank.resample_surface(2, &expression);
+        assert!(bank.surface(2).is_some());
+        bank.invalidate_surface(2);
+        assert!(bank.surface(2).is_none());
+        assert_eq!(bank.valid_mask(), 0);
     }
 }

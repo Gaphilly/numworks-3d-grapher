@@ -17,11 +17,13 @@
 
 use crate::camera::{Camera, ProjectedLine, ProjectedPoint, Projector, ScreenPoint};
 use crate::eadk::{self, Color, Point, Rect};
+use crate::functions::{FunctionSet, FUNCTION_PAIRS, MAX_FUNCTIONS, MAX_FUNCTION_PAIRS};
 use crate::graph::{
     self, AxisVisibility, GraphOptions, LightingPreset, RenderingMode, Rgb888, SurfacePalette,
     TickGenerator, PALETTE, SOLID_SURFACE_COLORS,
 };
-use crate::surface::{Domain, Point3, SurfaceGrid, TriangleShades, MAX_COLUMNS, MAX_ROWS};
+use crate::intersections::{self, IntersectionCache, MAX_INTERSECTION_SEGMENTS_PER_PAIR};
+use crate::surface::{Domain, Point3, SurfaceBank, TriangleShades, MAX_COLUMNS, MAX_ROWS};
 #[cfg(test)]
 use crate::surface::{COLUMNS, ROWS, TRIANGLES_PER_CELL};
 
@@ -42,7 +44,6 @@ const MIN_NUMERIC_SURFACE_DISTANCE_SQUARED: i32 = 9;
 const MIN_AXIS_SURFACE_DISTANCE_SQUARED: i32 = 4;
 const SOLID_NEAR_DEPTH: f32 = 1.05;
 const DEPTH_KEY_MAX: f32 = u16::MAX as f32;
-#[cfg(test)]
 const SURFACE_GRID_DEPTH_TOLERANCE: u16 = 24;
 #[cfg(test)]
 const STANDARD_SURFACE_GRID_EDGE_COUNT: usize = 19 * (25 - 1) + 25 * (19 - 1);
@@ -111,8 +112,8 @@ const SURFACE_SHADE_LUTS: [[[u16; 256]; SurfacePalette::BUILTIN_COUNT]; Lighting
 // non-reentrant: `custom_surface_shade_lut` completes every write before it
 // returns an immutable reference, and no Rust interrupt handler accesses it.
 // Those invariants are required for the narrowly contained unsafe access below.
-static mut CUSTOM_SURFACE_SHADE_LUT: [u16; 256] = [0; 256];
-static mut CUSTOM_SURFACE_SHADE_KEY: u32 = u32::MAX;
+static mut CUSTOM_SURFACE_SHADE_LUTS: [[u16; 256]; MAX_FUNCTIONS] = [[0; 256]; MAX_FUNCTIONS];
+static mut CUSTOM_SURFACE_SHADE_KEYS: [u32; MAX_FUNCTIONS] = [u32::MAX; MAX_FUNCTIONS];
 
 const fn build_surface_shade_luts(
 ) -> [[[u16; 256]; SurfacePalette::BUILTIN_COUNT]; LightingPreset::COUNT] {
@@ -163,15 +164,25 @@ const fn custom_shade_key(base: Rgb888, lighting: LightingPreset) -> u32 {
 
 /// Returns the persistent Custom table, refreshing it only when appearance changed.
 #[inline(never)]
-fn custom_surface_shade_lut(base: Rgb888, lighting: LightingPreset) -> &'static [u16; 256] {
+fn custom_surface_shade_lut(
+    function: usize,
+    base: Rgb888,
+    lighting: LightingPreset,
+) -> &'static [u16; 256] {
+    let function = function.min(MAX_FUNCTIONS - 1);
     let key = custom_shade_key(base, lighting);
     // SAFETY: the application has one cooperative execution thread. This
     // function is called before rasterization, is not reentrant, and the table
     // is never mutated while the returned reference is live in `render_solid`.
     unsafe {
-        let key_pointer = core::ptr::addr_of_mut!(CUSTOM_SURFACE_SHADE_KEY);
+        let key_pointer = core::ptr::addr_of_mut!(CUSTOM_SURFACE_SHADE_KEYS)
+            .cast::<u32>()
+            .add(function);
         if key_pointer.read() != key {
-            let table_pointer = core::ptr::addr_of_mut!(CUSTOM_SURFACE_SHADE_LUT).cast::<u16>();
+            let table_pointer = core::ptr::addr_of_mut!(CUSTOM_SURFACE_SHADE_LUTS)
+                .cast::<[u16; 256]>()
+                .add(function)
+                .cast::<u16>();
             let ambient = LIGHTING_AMBIENT[lighting.index()];
             let mut level = 0;
             while level < 256 {
@@ -182,14 +193,21 @@ fn custom_surface_shade_lut(base: Rgb888, lighting: LightingPreset) -> &'static 
             }
             key_pointer.write(key);
         }
-        &*core::ptr::addr_of!(CUSTOM_SURFACE_SHADE_LUT)
+        &*core::ptr::addr_of!(CUSTOM_SURFACE_SHADE_LUTS)
+            .cast::<[u16; 256]>()
+            .add(function)
     }
 }
 
-fn surface_shade_lut(options: GraphOptions) -> &'static [u16; 256] {
-    match options.surface_palette.builtin_index() {
-        Some(palette) => &SURFACE_SHADE_LUTS[options.lighting.index()][palette],
-        None => custom_surface_shade_lut(options.custom_rgb, options.lighting),
+fn surface_shade_lut(
+    function: usize,
+    palette: SurfacePalette,
+    custom_rgb: Rgb888,
+    lighting: LightingPreset,
+) -> &'static [u16; 256] {
+    match palette.builtin_index() {
+        Some(palette) => &SURFACE_SHADE_LUTS[lighting.index()][palette],
+        None => custom_surface_shade_lut(function, custom_rgb, lighting),
     }
 }
 
@@ -306,6 +324,40 @@ struct ProjectionScratch {
     inverse_depths: [[u16; MAX_COLUMNS]; MAX_ROWS],
 }
 
+struct ProjectionBank {
+    surfaces: [ProjectionScratch; MAX_FUNCTIONS],
+    intersections: [ProjectedIntersectionPair; MAX_FUNCTION_PAIRS],
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedIntersectionSegment {
+    start: SolidVertex,
+    end: SolidVertex,
+}
+
+impl ProjectedIntersectionSegment {
+    const EMPTY: Self = Self {
+        start: SolidVertex {
+            screen: ScreenPoint { x: 0, y: 0 },
+            inverse_depth: 0,
+        },
+        end: SolidVertex {
+            screen: ScreenPoint { x: 0, y: 0 },
+            inverse_depth: 0,
+        },
+    };
+}
+
+struct ProjectedIntersectionPair {
+    segments: [ProjectedIntersectionSegment; MAX_INTERSECTION_SEGMENTS_PER_PAIR],
+    count: u16,
+}
+
+const EMPTY_PROJECTED_PAIR: ProjectedIntersectionPair = ProjectedIntersectionPair {
+    segments: [ProjectedIntersectionSegment::EMPTY; MAX_INTERSECTION_SEGMENTS_PER_PAIR],
+    count: 0,
+};
+
 impl ProjectionScratch {
     #[inline]
     fn solid_vertex(&self, row: usize, column: usize) -> SolidVertex {
@@ -316,11 +368,26 @@ impl ProjectionScratch {
     }
 }
 
-static mut PROJECTION_SCRATCH: ProjectionScratch = ProjectionScratch {
-    // Active entries are overwritten before an immutable borrow is created, so
-    // zero initialization keeps this large fixed scratch object in `.bss`.
+const EMPTY_PROJECTION: ProjectionScratch = ProjectionScratch {
     screens: [[ScreenPoint { x: 0, y: 0 }; MAX_COLUMNS]; MAX_ROWS],
     inverse_depths: [[0; MAX_COLUMNS]; MAX_ROWS],
+};
+
+static mut PROJECTION_BANK: ProjectionBank = ProjectionBank {
+    surfaces: [
+        EMPTY_PROJECTION,
+        EMPTY_PROJECTION,
+        EMPTY_PROJECTION,
+        EMPTY_PROJECTION,
+    ],
+    intersections: [
+        EMPTY_PROJECTED_PAIR,
+        EMPTY_PROJECTED_PAIR,
+        EMPTY_PROJECTED_PAIR,
+        EMPTY_PROJECTED_PAIR,
+        EMPTY_PROJECTED_PAIR,
+        EMPTY_PROJECTED_PAIR,
+    ],
 };
 
 /// Grants exclusive access to the renderer-private projection scratch.
@@ -331,8 +398,8 @@ static mut PROJECTION_SCRATCH: ProjectionScratch = ProjectionScratch {
 /// reborrowing it immutably for geometry/rasterization, and returns before any
 /// later render may overwrite it. The static never escapes this module.
 #[inline(never)]
-fn with_projection_scratch<R>(callback: impl FnOnce(&mut ProjectionScratch) -> R) -> R {
-    unsafe { callback(&mut *core::ptr::addr_of_mut!(PROJECTION_SCRATCH)) }
+fn with_projection_bank<R>(callback: impl FnOnce(&mut ProjectionBank) -> R) -> R {
+    unsafe { callback(&mut *core::ptr::addr_of_mut!(PROJECTION_BANK)) }
 }
 
 impl SolidVertex {
@@ -354,6 +421,12 @@ enum ProjectedSurface<'a> {
     Wireframe(&'a [[ScreenPoint; COLUMNS]; ROWS]),
     Shared {
         screens: &'a [[ScreenPoint; MAX_COLUMNS]; MAX_ROWS],
+        rows: usize,
+        columns: usize,
+    },
+    Multi {
+        projections: &'a ProjectionBank,
+        active_mask: u8,
         rows: usize,
         columns: usize,
     },
@@ -381,6 +454,27 @@ impl ProjectedSurface<'_> {
                     ScreenPoint::INVALID
                 }
             }
+            Self::Multi {
+                projections,
+                active_mask,
+                rows,
+                columns,
+            } => {
+                if row >= rows || column >= columns {
+                    return ScreenPoint::INVALID;
+                }
+                let mut function = 0;
+                while function < MAX_FUNCTIONS {
+                    if active_mask & (1 << function) != 0 {
+                        let point = projections.surfaces[function].screens[row][column];
+                        if point.is_visible() {
+                            return point;
+                        }
+                    }
+                    function += 1;
+                }
+                ScreenPoint::INVALID
+            }
         }
     }
 
@@ -389,6 +483,7 @@ impl ProjectedSurface<'_> {
             #[cfg(test)]
             Self::Wireframe(_) => (ROWS, COLUMNS),
             Self::Shared { rows, columns, .. } => (rows, columns),
+            Self::Multi { rows, columns, .. } => (rows, columns),
         }
     }
 }
@@ -488,41 +583,69 @@ impl WorldGeometry {
 pub fn render(
     camera: &Camera,
     domain: Domain,
-    surface: &SurfaceGrid,
+    surfaces: &SurfaceBank,
+    functions: &FunctionSet,
+    intersections: &IntersectionCache,
     options: GraphOptions,
     diagnostics_enabled: bool,
 ) {
     match options.rendering_mode {
-        RenderingMode::Wireframe => render_wireframe(camera, domain, surface, options),
-        RenderingMode::Solid => render_solid(camera, domain, surface, options, diagnostics_enabled),
+        RenderingMode::Wireframe => {
+            render_wireframe(camera, domain, surfaces, functions, intersections, options)
+        }
+        RenderingMode::Solid => render_solid(
+            camera,
+            domain,
+            surfaces,
+            functions,
+            intersections,
+            options,
+            diagnostics_enabled,
+        ),
     }
 }
 
 // Prevent release LTO from merging the mutually exclusive stack frames: the
 // wireframe call must never reserve the depth/lighting storage used by solid.
 #[inline(never)]
-fn render_wireframe(camera: &Camera, domain: Domain, surface: &SurfaceGrid, options: GraphOptions) {
-    with_projection_scratch(|scratch| {
+fn render_wireframe(
+    camera: &Camera,
+    domain: Domain,
+    surfaces: &SurfaceBank,
+    functions: &FunctionSet,
+    intersections: &IntersectionCache,
+    options: GraphOptions,
+) {
+    with_projection_bank(|scratch| {
         let projector = camera.projector();
-        let (z_min, z_max, has_height) = surface.z_range();
-        let mut row = 0;
-        while row < surface.rows() {
-            let mut column = 0;
-            while column < surface.columns() {
-                // Keep Wireframe's released projection operation exactly intact.
-                scratch.screens[row][column] =
-                    projector.project(surface.point(domain, column, row));
-                column += 1;
+        let active_mask = functions.enabled_mask() & surfaces.valid_mask();
+        let (z_min, z_max, has_height) = surfaces.union_z_range(active_mask);
+        let mut function = 0;
+        while function < MAX_FUNCTIONS {
+            if active_mask & (1 << function) != 0 {
+                let mut row = 0;
+                while row < surfaces.rows() {
+                    let mut column = 0;
+                    while column < surfaces.columns() {
+                        scratch.surfaces[function].screens[row][column] =
+                            projector.project(surfaces.point(function, column, row));
+                        scratch.surfaces[function].inverse_depths[row][column] = 0;
+                        column += 1;
+                    }
+                    row += 1;
+                }
             }
-            row += 1;
+            function += 1;
         }
+        project_intersections(&projector, surfaces, intersections, active_mask, scratch);
         // End the exclusive population borrow before handing the cache to any
         // geometry or rasterization code.
-        let scratch: &ProjectionScratch = scratch;
-        let projected = ProjectedSurface::Shared {
-            screens: &scratch.screens,
-            rows: surface.rows(),
-            columns: surface.columns(),
+        let scratch: &ProjectionBank = scratch;
+        let projected = ProjectedSurface::Multi {
+            projections: scratch,
+            active_mask,
+            rows: surfaces.rows(),
+            columns: surfaces.columns(),
         };
         let geometry = build_world_geometry(
             &projector, domain, z_min, z_max, has_height, projected, options,
@@ -539,7 +662,24 @@ fn render_wireframe(camera: &Camera, domain: Domain, surface: &SurfaceGrid, opti
             draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Axis);
             draw_label_backgrounds(&mut pixels, band_y, &geometry);
             draw_labels(&mut pixels, band_y, &geometry, true);
-            draw_wireframe_surface(&mut pixels, band_y, projected);
+            let mut function = 0;
+            while function < MAX_FUNCTIONS {
+                if active_mask & (1 << function) != 0 {
+                    let slot = &functions.slots[function];
+                    draw_wireframe_surface_colored(
+                        &mut pixels,
+                        band_y,
+                        ProjectedSurface::Shared {
+                            screens: &scratch.surfaces[function].screens,
+                            rows: surfaces.rows(),
+                            columns: surfaces.columns(),
+                        },
+                        wireframe_color(slot.palette, slot.custom_rgb),
+                    );
+                }
+                function += 1;
+            }
+            draw_intersections_wireframe(&mut pixels, band_y, scratch, intersections, active_mask);
             draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
             draw_origin(&mut pixels, band_y, geometry.origin);
             draw_labels(&mut pixels, band_y, &geometry, false);
@@ -562,42 +702,67 @@ fn render_wireframe(camera: &Camera, domain: Domain, surface: &SurfaceGrid, opti
 fn render_solid(
     camera: &Camera,
     domain: Domain,
-    surface: &SurfaceGrid,
+    surfaces: &SurfaceBank,
+    functions: &FunctionSet,
+    intersections: &IntersectionCache,
     options: GraphOptions,
     diagnostics_enabled: bool,
 ) {
     diagnostic_marker(diagnostics_enabled, b"P00\0");
     // Lighting is cached at surface-sampling time. This Solid-only path avoids
     // recomputing 864 normals/square roots/divisions on camera-only redraws.
-    let triangle_shades = surface.triangle_shades();
-    let shade_colors = surface_shade_lut(options);
-    with_projection_scratch(|scratch| {
-        let projector = camera.projector();
-        let (z_min, z_max, has_height) = surface.z_range();
-        let mut row = 0;
-        while row < surface.rows() {
-            let mut column = 0;
-            while column < surface.columns() {
-                scratch.screens[row][column] = ScreenPoint::INVALID;
-                scratch.inverse_depths[row][column] = 0;
-                if let Some(point) = projector.project_with_depth(surface.solid_point(column, row))
-                {
-                    let inverse_depth = encode_inverse_depth(point.depth);
-                    if inverse_depth != 0 {
-                        scratch.screens[row][column] = point.screen;
-                        scratch.inverse_depths[row][column] = inverse_depth;
-                    }
-                }
-                column += 1;
-            }
-            row += 1;
+    let mut shade_colors: [Option<&'static [u16; 256]>; MAX_FUNCTIONS] = [None; MAX_FUNCTIONS];
+    let active_mask = functions.enabled_mask() & surfaces.valid_mask();
+    let mut function = 0;
+    while function < MAX_FUNCTIONS {
+        if active_mask & (1 << function) != 0 {
+            let slot = &functions.slots[function];
+            shade_colors[function] = Some(surface_shade_lut(
+                function,
+                slot.palette,
+                slot.custom_rgb,
+                options.lighting,
+            ));
         }
+        function += 1;
+    }
+    with_projection_bank(|scratch| {
+        let projector = camera.projector();
+        let (z_min, z_max, has_height) = surfaces.union_z_range(active_mask);
+        let mut function = 0;
+        while function < MAX_FUNCTIONS {
+            if active_mask & (1 << function) != 0 {
+                let mut row = 0;
+                while row < surfaces.rows() {
+                    let mut column = 0;
+                    while column < surfaces.columns() {
+                        scratch.surfaces[function].screens[row][column] = ScreenPoint::INVALID;
+                        scratch.surfaces[function].inverse_depths[row][column] = 0;
+                        if let Some(point) =
+                            projector.project_with_depth(surfaces.point(function, column, row))
+                        {
+                            let inverse_depth = encode_inverse_depth(point.depth);
+                            if inverse_depth != 0 {
+                                scratch.surfaces[function].screens[row][column] = point.screen;
+                                scratch.surfaces[function].inverse_depths[row][column] =
+                                    inverse_depth;
+                            }
+                        }
+                        column += 1;
+                    }
+                    row += 1;
+                }
+            }
+            function += 1;
+        }
+        project_intersections(&projector, surfaces, intersections, active_mask, scratch);
         // No code below this point mutates the shared cache during this render.
-        let scratch: &ProjectionScratch = scratch;
-        let projected = ProjectedSurface::Shared {
-            screens: &scratch.screens,
-            rows: surface.rows(),
-            columns: surface.columns(),
+        let scratch: &ProjectionBank = scratch;
+        let projected = ProjectedSurface::Multi {
+            projections: scratch,
+            active_mask,
+            rows: surfaces.rows(),
+            columns: surfaces.columns(),
         };
         let geometry = build_world_geometry(
             &projector, domain, z_min, z_max, has_height, projected, options,
@@ -617,15 +782,33 @@ fn render_solid(
             draw_label_backgrounds(&mut pixels, band_y, &geometry);
             draw_labels(&mut pixels, band_y, &geometry, true);
             diagnostic_marker_band(diagnostics_enabled, b'F', band_y);
-            draw_solid_surface(
+            let mut function = 0;
+            while function < MAX_FUNCTIONS {
+                if let (Some(surface), Some(colors)) =
+                    (surfaces.surface(function), shade_colors[function])
+                {
+                    if active_mask & (1 << function) != 0 {
+                        draw_solid_surface(
+                            &mut pixels,
+                            &mut depth,
+                            band_y,
+                            &scratch.surfaces[function],
+                            surfaces.rows(),
+                            surfaces.columns(),
+                            surface.triangle_shades(),
+                            colors,
+                        );
+                    }
+                }
+                function += 1;
+            }
+            draw_intersections_solid(
                 &mut pixels,
-                &mut depth,
+                &depth,
                 band_y,
                 scratch,
-                surface.rows(),
-                surface.columns(),
-                triangle_shades,
-                shade_colors,
+                intersections,
+                active_mask,
             );
             draw_geometry_lines(&mut pixels, band_y, &geometry, LineLayer::Tick);
             draw_origin(&mut pixels, band_y, geometry.origin);
@@ -645,6 +828,148 @@ fn render_solid(
         }
     });
     diagnostic_marker(diagnostics_enabled, b"OK\0");
+}
+
+fn project_intersections(
+    projector: &Projector,
+    surfaces: &SurfaceBank,
+    intersections: &IntersectionCache,
+    active_mask: u8,
+    output: &mut ProjectionBank,
+) {
+    let mut pair_index = 0;
+    while pair_index < MAX_FUNCTION_PAIRS {
+        output.intersections[pair_index].count = 0;
+        let pair = FUNCTION_PAIRS[pair_index];
+        if active_mask & (1 << pair.0) != 0
+            && active_mask & (1 << pair.1) != 0
+            && intersections.visibility_mask() & (1 << pair_index) != 0
+        {
+            if let Some(cached) = intersections.pair(pair_index) {
+                for segment in cached.segments() {
+                    if output.intersections[pair_index].count as usize
+                        >= MAX_INTERSECTION_SEGMENTS_PER_PAIR
+                    {
+                        break;
+                    }
+                    let first = intersections::reconstruct_endpoint(
+                        segment.first,
+                        surfaces,
+                        pair.0,
+                        pair.1,
+                    );
+                    let second = intersections::reconstruct_endpoint(
+                        segment.second,
+                        surfaces,
+                        pair.0,
+                        pair.1,
+                    );
+                    if let (Some(first), Some(second)) = (first, second) {
+                        if let (Some(first), Some(second)) = (
+                            projector.project_with_depth(first),
+                            projector.project_with_depth(second),
+                        ) {
+                            let candidate = ProjectedIntersectionSegment {
+                                start: SolidVertex {
+                                    screen: first.screen,
+                                    inverse_depth: encode_inverse_depth(first.depth),
+                                },
+                                end: SolidVertex {
+                                    screen: second.screen,
+                                    inverse_depth: encode_inverse_depth(second.depth),
+                                },
+                            };
+                            if candidate.start.is_visible() && candidate.end.is_visible() {
+                                let index = output.intersections[pair_index].count as usize;
+                                output.intersections[pair_index].segments[index] = candidate;
+                                output.intersections[pair_index].count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pair_index += 1;
+    }
+}
+
+fn draw_intersections_wireframe(
+    pixels: &mut [Color],
+    band_y: usize,
+    projected: &ProjectionBank,
+    intersections: &IntersectionCache,
+    active_mask: u8,
+) {
+    let mut pair = 0;
+    while pair < MAX_FUNCTION_PAIRS {
+        let functions = FUNCTION_PAIRS[pair];
+        if active_mask & (1 << functions.0) != 0
+            && active_mask & (1 << functions.1) != 0
+            && intersections.visibility_mask() & (1 << pair) != 0
+        {
+            let data = &projected.intersections[pair];
+            let mut index = 0;
+            while index < data.count as usize {
+                let segment = data.segments[index];
+                draw_line(
+                    pixels,
+                    band_y,
+                    segment.start.screen,
+                    segment.end.screen,
+                    Color { rgb565: 0x0000 },
+                );
+                index += 1;
+            }
+        }
+        pair += 1;
+    }
+}
+
+fn draw_intersections_solid(
+    pixels: &mut [Color],
+    depth: &[u16],
+    band_y: usize,
+    projected: &ProjectionBank,
+    intersections: &IntersectionCache,
+    active_mask: u8,
+) {
+    let mut pair = 0;
+    while pair < MAX_FUNCTION_PAIRS {
+        let functions = FUNCTION_PAIRS[pair];
+        if active_mask & (1 << functions.0) != 0
+            && active_mask & (1 << functions.1) != 0
+            && intersections.visibility_mask() & (1 << pair) != 0
+        {
+            let data = &projected.intersections[pair];
+            let mut index = 0;
+            while index < data.count as usize {
+                let segment = data.segments[index];
+                draw_depth_line(
+                    pixels,
+                    depth,
+                    band_y,
+                    segment.start,
+                    segment.end,
+                    Color { rgb565: 0x0000 },
+                );
+                index += 1;
+            }
+        }
+        pair += 1;
+    }
+}
+
+fn wireframe_color(palette: SurfacePalette, custom: Rgb888) -> Color {
+    if palette == SurfacePalette::Blue {
+        PALETTE.surface
+    } else {
+        Color {
+            rgb565: match palette.builtin_index() {
+                Some(index) => SOLID_SURFACE_COLORS[index],
+                None => custom.to_rgb565(),
+            },
+        }
+    }
 }
 
 // EADK offers neither a serial console nor persistent crash logs. The tiny
@@ -1150,7 +1475,17 @@ fn add_axis_label(
     }
 }
 
+#[cfg(test)]
 fn draw_wireframe_surface(pixels: &mut [Color], band_y: usize, projected: ProjectedSurface<'_>) {
+    draw_wireframe_surface_colored(pixels, band_y, projected, PALETTE.surface);
+}
+
+fn draw_wireframe_surface_colored(
+    pixels: &mut [Color],
+    band_y: usize,
+    projected: ProjectedSurface<'_>,
+    color: Color,
+) {
     let (rows, columns) = projected.dimensions();
     let mut row = 0;
     while row < rows {
@@ -1162,7 +1497,7 @@ fn draw_wireframe_surface(pixels: &mut [Color], band_y: usize, projected: Projec
                     band_y,
                     projected.screen(row, column),
                     projected.screen(row, column + 1),
-                    PALETTE.surface,
+                    color,
                 );
             }
             if row + 1 < rows {
@@ -1171,7 +1506,7 @@ fn draw_wireframe_surface(pixels: &mut [Color], band_y: usize, projected: Projec
                     band_y,
                     projected.screen(row, column),
                     projected.screen(row + 1, column),
-                    PALETTE.surface,
+                    color,
                 );
             }
             column += 1;
@@ -1465,7 +1800,6 @@ fn vertical_surface_edge_is_valid(
 /// Draws only portions of a surface edge whose reciprocal depth matches the
 /// visible fill. Back-facing grid edges therefore do not show through solid
 /// triangles and turn the result back into an opaque wireframe.
-#[cfg(test)]
 fn draw_depth_line(
     pixels: &mut [Color],
     depth: &[u16],
@@ -1549,7 +1883,6 @@ fn draw_depth_line(
 /// screen coordinates to roughly ±800, so the small integer products below
 /// remain safely in `i32`. Out-of-contract direct callers retain the original
 /// full traversal through the conservative fallback.
-#[cfg(test)]
 fn depth_line_band_steps(
     y0: i32,
     y1: i32,
@@ -1625,7 +1958,6 @@ fn depth_line_band_steps(
 /// Reconstructs the exact Bresenham point and error state after `step` global
 /// steps. Continuing the ordinary loop from this state preserves both pixel
 /// coverage and the existing global-step depth interpolation.
-#[cfg(test)]
 fn depth_line_state_at_step(
     x0: i32,
     y0: i32,
@@ -1998,36 +2330,57 @@ fn label_rects_overlap(first: LabelRect, second: LabelRect, separation: i32) -> 
 fn surface_distance_squared(rect: LabelRect, projected_surface: ProjectedSurface<'_>) -> i32 {
     let (rows, columns) = projected_surface.dimensions();
     let mut minimum = i32::MAX;
-    let mut row = 0;
-    while row < rows {
-        let mut column = 0;
-        while column < columns {
-            let point = projected_surface.screen(row, column);
-            if point.is_visible() {
-                let x = point.x as i32;
-                let y = point.y as i32;
-                let dx = if x < rect.left {
-                    rect.left - x
-                } else if x > rect.right {
-                    x - rect.right
-                } else {
-                    0
+    let surface_count = match projected_surface {
+        ProjectedSurface::Multi { .. } => MAX_FUNCTIONS,
+        _ => 1,
+    };
+    let mut function = 0;
+    while function < surface_count {
+        let mut row = 0;
+        while row < rows {
+            let mut column = 0;
+            while column < columns {
+                let point = match projected_surface {
+                    ProjectedSurface::Multi {
+                        projections,
+                        active_mask,
+                        ..
+                    } => {
+                        if active_mask & (1 << function) != 0 {
+                            projections.surfaces[function].screens[row][column]
+                        } else {
+                            ScreenPoint::INVALID
+                        }
+                    }
+                    _ => projected_surface.screen(row, column),
                 };
-                let dy = if y < rect.top {
-                    rect.top - y
-                } else if y > rect.bottom {
-                    y - rect.bottom
-                } else {
-                    0
-                };
-                let distance = dx * dx + dy * dy;
-                if distance < minimum {
-                    minimum = distance;
+                if point.is_visible() {
+                    let x = point.x as i32;
+                    let y = point.y as i32;
+                    let dx = if x < rect.left {
+                        rect.left - x
+                    } else if x > rect.right {
+                        x - rect.right
+                    } else {
+                        0
+                    };
+                    let dy = if y < rect.top {
+                        rect.top - y
+                    } else if y > rect.bottom {
+                        y - rect.bottom
+                    } else {
+                        0
+                    };
+                    let distance = dx * dx + dy * dy;
+                    if distance < minimum {
+                        minimum = distance;
+                    }
                 }
+                column += 1;
             }
-            column += 1;
+            row += 1;
         }
-        row += 1;
+        function += 1;
     }
     minimum
 }
@@ -2979,5 +3332,82 @@ mod tests {
         assert_eq!(geometry.line_count, 0);
         assert_eq!(geometry.label_count, 0);
         assert_eq!(geometry.origin, None);
+    }
+
+    #[test]
+    fn four_surface_projection_and_intersection_scratch_is_fixed_capacity() {
+        assert_eq!(core::mem::size_of::<ProjectionScratch>(), 7_626);
+        assert_eq!(core::mem::size_of::<ProjectedIntersectionSegment>(), 12);
+        assert_eq!(core::mem::size_of::<ProjectedIntersectionPair>(), 3_074);
+        assert_eq!(core::mem::size_of::<ProjectionBank>(), 48_948);
+    }
+
+    #[test]
+    fn nearer_surface_wins_one_shared_depth_band_independent_of_function_order() {
+        let mut first_pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut first_depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut second_pixels = first_pixels;
+        let mut second_depth = first_depth;
+        let far = [
+            SolidVertex {
+                screen: ScreenPoint { x: 20, y: 26 },
+                inverse_depth: 10_000,
+            },
+            SolidVertex {
+                screen: ScreenPoint { x: 70, y: 26 },
+                inverse_depth: 10_000,
+            },
+            SolidVertex {
+                screen: ScreenPoint { x: 20, y: 31 },
+                inverse_depth: 10_000,
+            },
+        ];
+        let near = [
+            SolidVertex {
+                screen: ScreenPoint { x: 20, y: 26 },
+                inverse_depth: 20_000,
+            },
+            SolidVertex {
+                screen: ScreenPoint { x: 70, y: 26 },
+                inverse_depth: 20_000,
+            },
+            SolidVertex {
+                screen: ScreenPoint { x: 20, y: 31 },
+                inverse_depth: 20_000,
+            },
+        ];
+        let far_color = Color { rgb565: 0xf800 };
+        let near_color = Color { rgb565: 0x07e0 };
+        draw_triangle_band(
+            &mut first_pixels,
+            &mut first_depth,
+            GRAPH_TOP,
+            far,
+            far_color,
+        );
+        draw_triangle_band(
+            &mut first_pixels,
+            &mut first_depth,
+            GRAPH_TOP,
+            near,
+            near_color,
+        );
+        draw_triangle_band(
+            &mut second_pixels,
+            &mut second_depth,
+            GRAPH_TOP,
+            near,
+            near_color,
+        );
+        draw_triangle_band(
+            &mut second_pixels,
+            &mut second_depth,
+            GRAPH_TOP,
+            far,
+            far_color,
+        );
+        assert_eq!(first_depth, second_depth);
+        assert_eq!(first_pixels, second_pixels);
+        assert!(first_pixels.iter().any(|pixel| *pixel == near_color));
     }
 }

@@ -14,8 +14,10 @@ pub mod eadk;
 mod editor;
 mod expression;
 mod function;
+mod functions;
 mod graph;
 mod input;
+mod intersections;
 mod math;
 mod rendering;
 mod settings;
@@ -53,51 +55,21 @@ pub static EADK_APP_ICON: [u8; include_bytes!("../target/icon.nwi").len()] =
 /// Firmware-invoked C entry point. It never depends on a Rust standard runtime.
 #[no_mangle]
 pub extern "C" fn main() {
-    let mut function = match expression::CompiledExpression::compile("sin(x) * cos(y)") {
-        Ok(expression) => expression,
-        Err(_) => loop {},
-    };
     let mut app = app::AppState::new();
-    // Heights are separate from the compiled bytecode and projection. Camera
-    // movement therefore pays only transformation/rasterization cost.
-    surface::with_active_surface(|surface| {
-        surface.resample_with_resolution(app.domain, &function, app.graph_options.resolution);
-    });
-    app.dirty.surface = false;
+    initialize_application(&mut app);
 
     loop {
         if app.dirty.content {
             match app.active_tab {
                 app::Tab::Graph => {
                     let render_started_ms = eadk::timing::millis();
-                    surface::with_active_surface(|surface| {
-                        if app.dirty.surface {
-                            surface.resample_with_resolution(
-                                app.domain,
-                                &function,
-                                app.graph_options.resolution,
-                            );
-                            app.dirty.surface = false;
-                        }
-                        // End mutable sampling access before the renderer reads
-                        // this long-lived fixed cache for the complete frame.
-                        let surface: &surface::SurfaceGrid = surface;
-                        rendering::render(
-                            &app.camera,
-                            app.domain,
-                            surface,
-                            app.graph_options,
-                            RENDER_FREEZE_DIAGNOSTICS,
-                        );
-                    });
+                    render_graph_frame(&mut app);
                     app.record_graph_render_ms(
                         eadk::timing::millis().saturating_sub(render_started_ms),
                     );
                     app.dirty.graph = false;
                 }
-                app::Tab::Equation => {
-                    ui::draw_equation_editor(&app.editor, app.focus == app::Focus::Content)
-                }
+                app::Tab::Equation => draw_equation_frame(&app),
                 app::Tab::Settings => ui::draw_settings(
                     &app.settings,
                     app.graph_options,
@@ -146,7 +118,7 @@ pub extern "C" fn main() {
                 && app.focus == app::Focus::Content
             {
                 if let Some(event) = semantic_event {
-                    let _ = app.handle_editor_event(event, &mut function);
+                    let _ = app.handle_equation_event(event);
                 }
             } else if update == app::UpdateResult::Continue
                 && settings_editor_was_active
@@ -159,9 +131,95 @@ pub extern "C" fn main() {
                 }
             }
         }
-        app.update_key_repeat(keys, eadk::timing::millis(), &mut function);
+        app.update_key_repeat_current(keys, eadk::timing::millis());
         eadk::timing::msleep(20);
     }
+}
+
+#[cfg(not(test))]
+#[inline(never)]
+fn initialize_application(app: &mut app::AppState) {
+    functions::with_active_functions(|functions| functions.initialize());
+    intersections::with_intersections(|intersections| intersections.initialize());
+    surface::with_surface_bank(|surfaces| {
+        surfaces.prepare_coordinates(app.domain, app.graph_options.resolution);
+        functions::with_active_functions(|functions| {
+            if let Some(expression) = functions.slots[0].compiled.as_ref() {
+                surfaces.resample_surface(0, expression);
+            }
+        });
+    });
+    app.surface_dirty_mask = 0;
+    app.dirty.surface = false;
+}
+
+#[cfg(not(test))]
+#[inline(never)]
+fn render_graph_frame(app: &mut app::AppState) {
+    surface::with_surface_bank(|surfaces| {
+        functions::with_active_functions(|functions| {
+            if app.coordinates_dirty || surfaces.resolution() != app.graph_options.resolution {
+                surfaces.prepare_coordinates(app.domain, app.graph_options.resolution);
+                app.surface_dirty_mask |= functions.enabled_mask();
+                app.coordinates_dirty = false;
+            }
+            let mut index = 0;
+            while index < functions::MAX_FUNCTIONS {
+                if app.surface_dirty_mask & (1 << index) != 0 {
+                    if functions.slots[index].enabled {
+                        if let Some(expression) = functions.slots[index].compiled.as_ref() {
+                            surfaces.resample_surface(index, expression);
+                        } else {
+                            surfaces.invalidate_surface(index);
+                        }
+                    } else {
+                        surfaces.invalidate_surface(index);
+                    }
+                }
+                index += 1;
+            }
+            app.surface_dirty_mask = 0;
+            app.dirty.surface = false;
+            intersections::with_intersections(|intersections| {
+                intersections.invalidate(app.intersection_dirty_mask);
+                let mut pair = 0;
+                while pair < functions::MAX_FUNCTION_PAIRS {
+                    if app.intersection_dirty_mask & (1 << pair) != 0 {
+                        intersections.rebuild_pair(pair, surfaces);
+                    }
+                    pair += 1;
+                }
+                app.intersection_dirty_mask = 0;
+                rendering::render(
+                    &app.camera,
+                    app.domain,
+                    surfaces,
+                    functions,
+                    intersections,
+                    app.graph_options,
+                    RENDER_FREEZE_DIAGNOSTICS,
+                );
+            });
+        });
+    });
+}
+
+#[cfg(not(test))]
+#[inline(never)]
+fn draw_equation_frame(app: &app::AppState) {
+    functions::with_active_functions(|functions| {
+        intersections::with_intersections(|intersections| {
+            surface::with_surface_bank(|surfaces| {
+                ui::draw_equation(
+                    app,
+                    functions,
+                    intersections,
+                    surfaces,
+                    app.focus == app::Focus::Content,
+                )
+            })
+        })
+    })
 }
 
 #[cfg(not(test))]

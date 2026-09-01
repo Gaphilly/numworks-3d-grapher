@@ -17,9 +17,10 @@ use crate::editor::EditorAction;
 use crate::editor::EditorKeyRepeat;
 use crate::editor::EquationEditor;
 use crate::expression::CompiledExpression;
+use crate::functions::{self, pair_mask_for_function, MAX_FUNCTIONS, MAX_FUNCTION_PAIRS};
 use crate::graph::GraphOptions;
 use crate::input;
-use crate::settings::{SettingsAction, SettingsState};
+use crate::settings::{parse_color_channel, NumericEditor, SettingsAction, SettingsState};
 use crate::surface::Domain;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,6 +78,15 @@ pub struct DirtyFlags {
     pub surface: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EquationPage {
+    FunctionList,
+    FunctionDetail,
+    ExpressionEditor,
+    CustomColor,
+    Intersections,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 /// Outcome consumed by the cooperative main loop.
 pub enum UpdateResult {
@@ -96,6 +106,18 @@ pub struct AppState {
     pub focus: Focus,
     pub dirty: DirtyFlags,
     pub editor: EquationEditor,
+    pub equation_page: EquationPage,
+    pub selected_function: u8,
+    pub function_detail_row: u8,
+    pub selected_pair: u8,
+    pub surface_dirty_mask: u8,
+    pub intersection_dirty_mask: u8,
+    pub coordinates_dirty: bool,
+    pub custom_color_draft: crate::graph::Rgb888,
+    pub custom_color_row: u8,
+    pub custom_numeric_editing: bool,
+    pub custom_numeric_error: bool,
+    pub(crate) custom_numeric: NumericEditor,
     auto_rotate: bool,
     auto_rotate_armed: bool,
     auto_rotate_last_ms: u64,
@@ -124,6 +146,18 @@ impl AppState {
                 surface: true,
             },
             editor: EquationEditor::new(),
+            equation_page: EquationPage::FunctionList,
+            selected_function: 0,
+            function_detail_row: 0,
+            selected_pair: 0,
+            surface_dirty_mask: 1,
+            intersection_dirty_mask: 0,
+            coordinates_dirty: false,
+            custom_color_draft: crate::graph::Rgb888::DEFAULT_CUSTOM,
+            custom_color_row: 0,
+            custom_numeric_editing: false,
+            custom_numeric_error: false,
+            custom_numeric: NumericEditor::new(),
             auto_rotate: false,
             auto_rotate_armed: false,
             auto_rotate_last_ms: 0,
@@ -133,6 +167,349 @@ impl AppState {
             previous_keys: 0,
             pressed_keys: 0,
         }
+    }
+
+    fn mark_function_dirty(&mut self, function: usize) {
+        if function < MAX_FUNCTIONS {
+            self.surface_dirty_mask |= 1 << function;
+            self.intersection_dirty_mask |= pair_mask_for_function(function);
+            self.dirty.surface = true;
+            self.dirty.graph = true;
+        }
+    }
+
+    fn mark_all_enabled_surfaces_dirty(&mut self) {
+        let enabled = functions::with_active_functions(|set| set.enabled_mask());
+        self.surface_dirty_mask |= enabled;
+        self.intersection_dirty_mask = (1 << MAX_FUNCTION_PAIRS) - 1;
+        self.dirty.surface = self.surface_dirty_mask != 0;
+        self.dirty.graph = true;
+    }
+
+    pub fn handle_equation_event(&mut self, event: crate::eadk::event::Event) -> UpdateResult {
+        use crate::eadk::event as key;
+        match self.equation_page {
+            EquationPage::FunctionList => match event {
+                key::UP => {
+                    self.selected_function = self.selected_function.saturating_sub(1);
+                    self.dirty.content = true;
+                    UpdateResult::Continue
+                }
+                key::DOWN => {
+                    self.selected_function = (self.selected_function + 1).min(3);
+                    self.dirty.content = true;
+                    UpdateResult::Continue
+                }
+                key::EXE => {
+                    self.equation_page = EquationPage::FunctionDetail;
+                    self.function_detail_row = 0;
+                    self.dirty.content = true;
+                    UpdateResult::StateChanged
+                }
+                key::TOOLBOX => {
+                    self.equation_page = EquationPage::Intersections;
+                    self.dirty.content = true;
+                    UpdateResult::StateChanged
+                }
+                key::OK => self.focus_equation_tabs(),
+                key::BACK => {
+                    self.show_graph();
+                    UpdateResult::StateChanged
+                }
+                _ => UpdateResult::Continue,
+            },
+            EquationPage::FunctionDetail => self.handle_function_detail_event(event),
+            EquationPage::ExpressionEditor => match self.editor.handle_event(event) {
+                EditorAction::None => UpdateResult::Continue,
+                EditorAction::Changed => {
+                    self.save_selected_draft();
+                    self.dirty.content = true;
+                    UpdateResult::Continue
+                }
+                EditorAction::Submit => {
+                    self.save_selected_draft();
+                    let index = self.selected_function as usize;
+                    let compiled = functions::with_active_functions(|set| {
+                        set.slots[index].compile_draft().is_ok()
+                    });
+                    if compiled {
+                        self.editor.dismiss_error();
+                        self.mark_function_dirty(index);
+                        self.show_graph();
+                        UpdateResult::StateChanged
+                    } else {
+                        // Populate the editor's structured parse error without
+                        // changing the slot's last valid bytecode.
+                        let mut temporary = match CompiledExpression::compile("x") {
+                            Ok(value) => value,
+                            Err(_) => return UpdateResult::Continue,
+                        };
+                        let _ = self.editor.compile_into(&mut temporary);
+                        self.dirty.content = true;
+                        UpdateResult::Continue
+                    }
+                }
+                EditorAction::Cancel => {
+                    self.save_selected_draft();
+                    self.editor.dismiss_error();
+                    self.equation_page = EquationPage::FunctionDetail;
+                    self.dirty.content = true;
+                    UpdateResult::StateChanged
+                }
+                EditorAction::FocusTabs => self.focus_equation_tabs(),
+            },
+            EquationPage::Intersections => match event {
+                key::UP => {
+                    self.selected_pair = self.selected_pair.saturating_sub(1);
+                    self.dirty.content = true;
+                    UpdateResult::Continue
+                }
+                key::DOWN => {
+                    self.selected_pair = (self.selected_pair + 1).min(5);
+                    self.dirty.content = true;
+                    UpdateResult::Continue
+                }
+                key::LEFT | key::RIGHT | key::EXE => {
+                    crate::intersections::with_intersections(|cache| {
+                        cache.toggle_visibility(self.selected_pair as usize)
+                    });
+                    self.dirty.content = true;
+                    self.dirty.graph = true;
+                    UpdateResult::Continue
+                }
+                key::BACK => {
+                    self.equation_page = EquationPage::FunctionList;
+                    self.dirty.content = true;
+                    UpdateResult::StateChanged
+                }
+                key::OK => self.focus_equation_tabs(),
+                _ => UpdateResult::Continue,
+            },
+            EquationPage::CustomColor => self.handle_custom_color_event(event),
+        }
+    }
+
+    fn handle_function_detail_event(&mut self, event: crate::eadk::event::Event) -> UpdateResult {
+        use crate::eadk::event as key;
+        match event {
+            key::UP => self.function_detail_row = self.function_detail_row.saturating_sub(1),
+            key::DOWN => self.function_detail_row = (self.function_detail_row + 1).min(2),
+            key::BACK => {
+                self.equation_page = EquationPage::FunctionList;
+                self.dirty.content = true;
+                return UpdateResult::StateChanged;
+            }
+            key::OK => return self.focus_equation_tabs(),
+            key::LEFT | key::RIGHT | key::EXE => {
+                let index = self.selected_function as usize;
+                if self.function_detail_row == 0 {
+                    let can_enable = functions::with_active_functions(|set| {
+                        if set.slots[index].enabled {
+                            set.slots[index].enabled = false;
+                            true
+                        } else if set.slots[index].can_enable() {
+                            set.slots[index].enabled = true;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if can_enable {
+                        self.mark_function_dirty(index);
+                    } else {
+                        self.open_expression_editor();
+                    }
+                } else if self.function_detail_row == 1 {
+                    if event == key::EXE {
+                        self.open_expression_editor();
+                    }
+                } else {
+                    let current = functions::with_active_functions(|set| set.slots[index].palette);
+                    if event == key::EXE && current == crate::graph::SurfacePalette::Custom {
+                        self.custom_color_draft =
+                            functions::with_active_functions(|set| set.slots[index].custom_rgb);
+                        self.custom_color_row = 0;
+                        self.equation_page = EquationPage::CustomColor;
+                    } else {
+                        functions::with_active_functions(|set| {
+                            let slot = &mut set.slots[index];
+                            slot.palette = if event == key::LEFT {
+                                slot.palette.previous()
+                            } else {
+                                slot.palette.next()
+                            };
+                        });
+                    }
+                    self.dirty.graph = true;
+                }
+            }
+            _ => {}
+        }
+        self.dirty.content = true;
+        UpdateResult::Continue
+    }
+
+    fn handle_custom_color_event(&mut self, event: crate::eadk::event::Event) -> UpdateResult {
+        use crate::eadk::event as key;
+        if self.custom_numeric_editing {
+            match event {
+                key::LEFT => {
+                    let _ = self.custom_numeric.move_left();
+                }
+                key::RIGHT => {
+                    let _ = self.custom_numeric.move_right();
+                }
+                key::SHIFT_LEFT => {
+                    let _ = self.custom_numeric.move_to_start();
+                }
+                key::SHIFT_RIGHT => {
+                    let _ = self.custom_numeric.move_to_end();
+                }
+                key::BACKSPACE => {
+                    let _ = self.custom_numeric.backspace();
+                }
+                key::CLEAR => {
+                    let _ = self.custom_numeric.clear();
+                }
+                key::BACK => {
+                    self.custom_numeric_editing = false;
+                    self.custom_numeric_error = false;
+                    self.custom_numeric.reset();
+                }
+                key::EXE => {
+                    if let Some(value) =
+                        parse_color_channel(self.custom_numeric.source().as_bytes())
+                    {
+                        match self.custom_color_row {
+                            0 => self.custom_color_draft.red = value,
+                            1 => self.custom_color_draft.green = value,
+                            _ => self.custom_color_draft.blue = value,
+                        }
+                        self.custom_numeric_editing = false;
+                        self.custom_numeric_error = false;
+                        self.custom_numeric.reset();
+                    } else {
+                        self.custom_numeric_error = true;
+                    }
+                }
+                key::ZERO => {
+                    let _ = self.custom_numeric.insert(b"0");
+                }
+                key::ONE => {
+                    let _ = self.custom_numeric.insert(b"1");
+                }
+                key::TWO => {
+                    let _ = self.custom_numeric.insert(b"2");
+                }
+                key::THREE => {
+                    let _ = self.custom_numeric.insert(b"3");
+                }
+                key::FOUR => {
+                    let _ = self.custom_numeric.insert(b"4");
+                }
+                key::FIVE => {
+                    let _ = self.custom_numeric.insert(b"5");
+                }
+                key::SIX => {
+                    let _ = self.custom_numeric.insert(b"6");
+                }
+                key::SEVEN => {
+                    let _ = self.custom_numeric.insert(b"7");
+                }
+                key::EIGHT => {
+                    let _ = self.custom_numeric.insert(b"8");
+                }
+                key::NINE => {
+                    let _ = self.custom_numeric.insert(b"9");
+                }
+                _ => {}
+            }
+            self.dirty.content = true;
+            return UpdateResult::Continue;
+        }
+        match event {
+            key::UP => self.custom_color_row = self.custom_color_row.saturating_sub(1),
+            key::DOWN => self.custom_color_row = (self.custom_color_row + 1).min(3),
+            key::LEFT | key::RIGHT if self.custom_color_row < 3 => {
+                let channel = match self.custom_color_row {
+                    0 => &mut self.custom_color_draft.red,
+                    1 => &mut self.custom_color_draft.green,
+                    _ => &mut self.custom_color_draft.blue,
+                };
+                *channel = if event == key::RIGHT {
+                    channel.saturating_add(8)
+                } else {
+                    channel.saturating_sub(8)
+                };
+            }
+            key::EXE if self.custom_color_row < 3 => {
+                let value = match self.custom_color_row {
+                    0 => self.custom_color_draft.red,
+                    1 => self.custom_color_draft.green,
+                    _ => self.custom_color_draft.blue,
+                };
+                self.custom_numeric.load(value as f32);
+                self.custom_numeric_editing = true;
+                self.custom_numeric_error = false;
+            }
+            key::EXE if self.custom_color_row == 3 => {
+                let index = self.selected_function as usize;
+                functions::with_active_functions(|set| {
+                    set.slots[index].custom_rgb = self.custom_color_draft;
+                    set.slots[index].palette = crate::graph::SurfacePalette::Custom;
+                });
+                self.equation_page = EquationPage::FunctionDetail;
+                self.dirty.graph = true;
+            }
+            key::BACK => {
+                self.custom_numeric.reset();
+                self.custom_numeric_editing = false;
+                self.equation_page = EquationPage::FunctionDetail;
+            }
+            key::OK => return self.focus_equation_tabs(),
+            _ => {}
+        }
+        self.dirty.content = true;
+        UpdateResult::Continue
+    }
+
+    fn open_expression_editor(&mut self) {
+        let source = functions::with_active_functions(|set| {
+            let slot = &set.slots[self.selected_function as usize];
+            let mut copy = [0; crate::expression::MAX_EXPRESSION_LENGTH];
+            let length = slot.draft_length as usize;
+            copy[..length].copy_from_slice(slot.draft());
+            (copy, length)
+        });
+        self.editor.load_source(&source.0[..source.1]);
+        self.equation_page = EquationPage::ExpressionEditor;
+    }
+
+    fn save_selected_draft(&mut self) {
+        let source = self.editor.source();
+        functions::with_active_functions(|set| {
+            let slot = &mut set.slots[self.selected_function as usize];
+            let changed = slot.draft() != source.as_bytes();
+            slot.draft_length = self.editor.copy_source_into(&mut slot.draft_source);
+            // Merely opening and closing an editor must not make an unchanged
+            // source look unapplied. Once bytes differ from the last known
+            // draft, only a successful compile may re-establish the invariant.
+            if changed {
+                slot.draft_matches_compiled = false;
+            }
+        });
+    }
+
+    fn focus_equation_tabs(&mut self) -> UpdateResult {
+        if self.equation_page == EquationPage::ExpressionEditor {
+            self.save_selected_draft();
+            let _ = self.editor.close_function_picker();
+        }
+        self.selected_tab = self.active_tab;
+        self.focus = Focus::Tabs;
+        self.dirty.header = true;
+        self.dirty.content = true;
+        UpdateResult::StateChanged
     }
 
     /// Whether transient automatic horizontal orbit is enabled.
@@ -195,6 +572,7 @@ impl AppState {
     ///
     /// Successful EXE replaces the active bytecode and marks surface samples
     /// dirty. Failed compilation leaves the active bytecode untouched.
+    #[cfg(test)]
     pub fn handle_editor_event(
         &mut self,
         event: crate::eadk::event::Event,
@@ -234,6 +612,7 @@ impl AppState {
     /// Generates bounded-time Backspace/Left/Right repeat events from raw held
     /// keys without blocking the main loop. The same timer is routed to whichever
     /// fixed-capacity text field currently owns semantic input.
+    #[cfg(test)]
     pub fn update_key_repeat(
         &mut self,
         keys: keyboard::State,
@@ -251,6 +630,29 @@ impl AppState {
         if let Some(event) = self.editor_repeat.update(keys, now_ms) {
             if equation_active {
                 let _ = self.handle_editor_event(event, active_expression);
+            } else {
+                let _ = self.handle_settings_event(event);
+            }
+        }
+    }
+
+    /// Repeat routing used by the multi-function Equation state machine.
+    pub fn update_key_repeat_current(&mut self, keys: keyboard::State, now_ms: u64) {
+        let equation_active = self.active_tab == Tab::Equation
+            && self.focus == Focus::Content
+            && (self.equation_page == EquationPage::ExpressionEditor
+                || (self.equation_page == EquationPage::CustomColor
+                    && self.custom_numeric_editing));
+        let settings_active = self.active_tab == Tab::Settings
+            && self.focus == Focus::Content
+            && self.settings.is_editing();
+        if !equation_active && !settings_active {
+            self.editor_repeat.reset();
+            return;
+        }
+        if let Some(event) = self.editor_repeat.update(keys, now_ms) {
+            if equation_active {
+                let _ = self.handle_equation_event(event);
             } else {
                 let _ = self.handle_settings_event(event);
             }
@@ -302,6 +704,14 @@ impl AppState {
                 let _ = self.settings.back();
             }
             if self.active_tab == Tab::Equation {
+                if self.equation_page == EquationPage::ExpressionEditor {
+                    self.save_selected_draft();
+                }
+                if self.equation_page == EquationPage::CustomColor {
+                    self.custom_numeric_editing = false;
+                    self.custom_numeric_error = false;
+                    self.custom_numeric.reset();
+                }
                 let _ = self.editor.close_function_picker();
             }
             self.selected_tab = self.active_tab;
@@ -356,6 +766,33 @@ impl AppState {
             self.dirty.content = true;
             return UpdateResult::StateChanged;
         }
+        if self.active_tab == Tab::Equation {
+            if self.equation_page == EquationPage::CustomColor && self.custom_numeric_editing {
+                self.custom_numeric_editing = false;
+                self.custom_numeric_error = false;
+                self.custom_numeric.reset();
+                self.dirty.content = true;
+                return UpdateResult::StateChanged;
+            }
+            match self.equation_page {
+                EquationPage::ExpressionEditor => {
+                    self.save_selected_draft();
+                    self.editor.dismiss_error();
+                    self.equation_page = EquationPage::FunctionDetail;
+                }
+                EquationPage::FunctionDetail
+                | EquationPage::CustomColor
+                | EquationPage::Intersections => {
+                    self.equation_page = EquationPage::FunctionList;
+                }
+                EquationPage::FunctionList => {
+                    self.show_graph();
+                    return UpdateResult::StateChanged;
+                }
+            }
+            self.dirty.content = true;
+            return UpdateResult::StateChanged;
+        }
         if self.active_tab != Tab::Graph {
             self.active_tab = Tab::Graph;
             self.selected_tab = Tab::Graph;
@@ -382,6 +819,8 @@ impl AppState {
                 self.dirty.content = true;
                 self.dirty.graph = true;
                 self.dirty.surface = true;
+                self.coordinates_dirty = true;
+                self.mark_all_enabled_surfaces_dirty();
                 UpdateResult::Continue
             }
             SettingsAction::AutoRotateChanged => {
@@ -396,6 +835,8 @@ impl AppState {
                 self.dirty.content = true;
                 self.dirty.graph = true;
                 self.dirty.surface = true;
+                self.coordinates_dirty = true;
+                self.mark_all_enabled_surfaces_dirty();
                 UpdateResult::Continue
             }
             SettingsAction::ResetCamera => {
@@ -578,7 +1019,7 @@ mod tests {
 
     #[test]
     fn app_state_storage_remains_bounded() {
-        assert_eq!(core::mem::size_of::<AppState>(), 320);
+        assert!(core::mem::size_of::<AppState>() <= 400);
     }
 
     #[test]
@@ -719,7 +1160,7 @@ mod tests {
         enter_settings(&mut app);
         let _ = app.update(key(keyboard::EXE));
         release(&mut app);
-        settings_move_down(&mut app, 2);
+        settings_move_down(&mut app, 1);
         app.dirty.graph = false;
         app.dirty.surface = false;
         app.dirty.content = false;
@@ -739,7 +1180,7 @@ mod tests {
         enter_settings(&mut app);
         let _ = app.update(key(keyboard::EXE));
         release(&mut app);
-        settings_move_down(&mut app, 2);
+        settings_move_down(&mut app, 1);
         let _ = app.update(key(keyboard::RIGHT));
         release(&mut app);
         let _ = app.update(key(keyboard::RIGHT));
@@ -761,34 +1202,20 @@ mod tests {
     #[test]
     fn custom_color_apply_dirties_graph_without_resampling() {
         let mut app = AppState::new();
-        enter_settings(&mut app);
-        let _ = app.update(key(keyboard::EXE));
-        release(&mut app);
-        let _ = app.update(key(keyboard::DOWN));
-        release(&mut app);
-        let _ = app.update(key(keyboard::LEFT));
-        release(&mut app);
-        assert_eq!(
-            app.graph_options.surface_palette,
-            crate::graph::SurfacePalette::Custom
-        );
-        let original = app.graph_options.custom_rgb;
-        let _ = app.update(key(keyboard::EXE));
-        release(&mut app);
-        assert_eq!(
-            app.settings.page(),
-            crate::settings::SettingsPage::CustomColor
-        );
-
-        let _ = app.update(key(keyboard::RIGHT));
-        release(&mut app);
-        assert_eq!(app.graph_options.custom_rgb, original);
-        settings_move_down(&mut app, 3);
+        app.active_tab = Tab::Equation;
+        app.equation_page = EquationPage::CustomColor;
+        app.custom_color_draft = crate::graph::Rgb888::DEFAULT_CUSTOM;
+        let original = app.custom_color_draft;
+        let _ = app.handle_equation_event(event::RIGHT);
+        let _ = app.handle_equation_event(event::DOWN);
+        let _ = app.handle_equation_event(event::DOWN);
+        let _ = app.handle_equation_event(event::DOWN);
         app.dirty.content = false;
         app.dirty.graph = false;
         app.dirty.surface = false;
-        let _ = app.update(key(keyboard::EXE));
-        assert_eq!(app.graph_options.custom_rgb.red, original.red + 8);
+        let _ = app.handle_equation_event(event::EXE);
+        let applied = functions::with_active_functions(|set| set.slots[0].custom_rgb);
+        assert_eq!(applied.red, original.red + 8);
         assert!(app.dirty.content);
         assert!(app.dirty.graph);
         assert!(!app.dirty.surface);
@@ -797,17 +1224,10 @@ mod tests {
     #[test]
     fn custom_color_ok_focuses_tabs_without_committing_draft() {
         let mut app = AppState::new();
-        enter_settings(&mut app);
-        let _ = app.update(key(keyboard::EXE));
-        release(&mut app);
-        let _ = app.update(key(keyboard::DOWN));
-        release(&mut app);
-        let _ = app.update(key(keyboard::LEFT));
-        release(&mut app);
-        let original = app.graph_options.custom_rgb;
-        let _ = app.update(key(keyboard::EXE));
-        release(&mut app);
-        let _ = app.update(key(keyboard::RIGHT));
+        app.active_tab = Tab::Equation;
+        app.equation_page = EquationPage::CustomColor;
+        let original = functions::with_active_functions(|set| set.slots[0].custom_rgb);
+        let _ = app.handle_equation_event(event::RIGHT);
         release(&mut app);
 
         assert!(matches!(
@@ -815,11 +1235,11 @@ mod tests {
             UpdateResult::StateChanged
         ));
         assert_eq!(app.focus, Focus::Tabs);
+        assert_eq!(app.equation_page, EquationPage::CustomColor);
         assert_eq!(
-            app.settings.page(),
-            crate::settings::SettingsPage::CustomColor
+            functions::with_active_functions(|set| set.slots[0].custom_rgb),
+            original
         );
-        assert_eq!(app.graph_options.custom_rgb, original);
     }
 
     #[test]
@@ -917,5 +1337,128 @@ mod tests {
         ));
         assert_eq!(app.focus, Focus::Content);
         assert!(app.dirty.content);
+    }
+
+    #[test]
+    fn empty_function_opens_editor_and_compiles_transactionally() {
+        functions::reset_active_functions();
+        let mut app = AppState::new();
+        app.active_tab = Tab::Equation;
+        app.selected_function = 1;
+        app.equation_page = EquationPage::FunctionDetail;
+        app.function_detail_row = 0;
+        app.surface_dirty_mask = 0;
+        app.intersection_dirty_mask = 0;
+
+        let _ = app.handle_equation_event(event::EXE);
+        assert_eq!(app.equation_page, EquationPage::ExpressionEditor);
+        assert_eq!(app.editor.source(), "");
+        let _ = app.handle_equation_event(event::XNT);
+        let _ = app.handle_equation_event(event::EXE);
+        assert_eq!(app.active_tab, Tab::Graph);
+        assert_eq!(app.surface_dirty_mask, 0b0010);
+        assert_eq!(app.intersection_dirty_mask, pair_mask_for_function(1));
+        functions::with_active_functions(|set| {
+            assert!(set.slots[1].enabled);
+            assert!(set.slots[1].compiled.is_some());
+            assert_eq!(set.slots[1].draft(), b"x");
+        });
+    }
+
+    #[test]
+    fn function_color_and_pair_visibility_are_render_only_changes() {
+        functions::reset_active_functions();
+        crate::intersections::with_intersections(|cache| cache.initialize());
+        let mut app = AppState::new();
+        app.active_tab = Tab::Equation;
+        app.equation_page = EquationPage::FunctionDetail;
+        app.function_detail_row = 2;
+        app.dirty.surface = false;
+        app.surface_dirty_mask = 0;
+        let before = functions::with_active_functions(|set| set.slots[0].palette);
+        let _ = app.handle_equation_event(event::RIGHT);
+        let after = functions::with_active_functions(|set| set.slots[0].palette);
+        assert_ne!(before, after);
+        assert!(app.dirty.graph);
+        assert!(!app.dirty.surface);
+        assert_eq!(app.surface_dirty_mask, 0);
+
+        app.equation_page = EquationPage::Intersections;
+        app.selected_pair = 0;
+        app.dirty.graph = false;
+        let before_visibility =
+            crate::intersections::with_intersections(|cache| cache.visibility_mask());
+        let _ = app.handle_equation_event(event::EXE);
+        let after_visibility =
+            crate::intersections::with_intersections(|cache| cache.visibility_mask());
+        assert_eq!(after_visibility, before_visibility ^ 1);
+        assert!(app.dirty.graph);
+        assert_eq!(app.surface_dirty_mask, 0);
+    }
+
+    #[test]
+    fn unchanged_editor_round_trip_keeps_draft_applied() {
+        functions::reset_active_functions();
+        let mut app = AppState::new();
+        app.active_tab = Tab::Equation;
+        app.focus = Focus::Content;
+        app.equation_page = EquationPage::FunctionDetail;
+        app.function_detail_row = 1;
+        let _ = app.handle_equation_event(event::EXE);
+        assert_eq!(app.equation_page, EquationPage::ExpressionEditor);
+        let _ = app.handle_equation_event(event::BACK);
+        assert!(functions::with_active_functions(
+            |set| set.slots[0].draft_matches_compiled
+        ));
+    }
+
+    #[test]
+    fn failed_function_compile_preserves_program_and_dirty_masks() {
+        functions::reset_active_functions();
+        let mut app = AppState::new();
+        app.active_tab = Tab::Equation;
+        app.focus = Focus::Content;
+        app.equation_page = EquationPage::FunctionDetail;
+        app.function_detail_row = 1;
+        let before = functions::with_active_functions(|set| {
+            set.slots[0].compiled.as_ref().unwrap().evaluate(0.5, 0.25)
+        });
+        let _ = app.handle_equation_event(event::EXE);
+        app.editor.load_source(b"sin(");
+        app.surface_dirty_mask = 0;
+        app.intersection_dirty_mask = 0;
+        app.dirty.surface = false;
+        let _ = app.handle_equation_event(event::EXE);
+        assert_eq!(app.equation_page, EquationPage::ExpressionEditor);
+        assert_eq!(app.surface_dirty_mask, 0);
+        assert_eq!(app.intersection_dirty_mask, 0);
+        assert!(!app.dirty.surface);
+        assert_eq!(
+            functions::with_active_functions(|set| set.slots[0]
+                .compiled
+                .as_ref()
+                .unwrap()
+                .evaluate(0.5, 0.25)),
+            before
+        );
+    }
+
+    #[test]
+    fn custom_color_back_discards_function_draft() {
+        functions::reset_active_functions();
+        let mut app = AppState::new();
+        app.active_tab = Tab::Equation;
+        app.focus = Focus::Content;
+        app.equation_page = EquationPage::CustomColor;
+        let original = functions::with_active_functions(|set| set.slots[0].custom_rgb);
+        app.custom_color_draft = original;
+        let _ = app.handle_equation_event(event::RIGHT);
+        assert_ne!(app.custom_color_draft, original);
+        let _ = app.handle_equation_event(event::BACK);
+        assert_eq!(app.equation_page, EquationPage::FunctionDetail);
+        assert_eq!(
+            functions::with_active_functions(|set| set.slots[0].custom_rgb),
+            original
+        );
     }
 }

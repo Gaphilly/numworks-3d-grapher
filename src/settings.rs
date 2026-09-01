@@ -31,7 +31,7 @@ pub const SETTINGS_ITEM_COUNT: usize = 8;
 /// Number of editable bounds on the Domain page.
 pub const DOMAIN_FIELD_COUNT: usize = 4;
 /// Number of bounded choices on the Appearance page.
-pub const APPEARANCE_ITEM_COUNT: usize = 4;
+pub const APPEARANCE_ITEM_COUNT: usize = 3;
 /// Three channels plus an explicit transactional Apply row.
 pub const CUSTOM_COLOR_ITEM_COUNT: usize = 4;
 /// Coarse channel adjustment used by Left/Right outside the numeric editor.
@@ -79,7 +79,6 @@ impl CustomColorItem {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AppearanceItem {
     Lighting,
-    SurfaceColor,
     Resolution,
     AutoRotate,
 }
@@ -88,17 +87,15 @@ impl AppearanceItem {
     pub fn index(self) -> usize {
         match self {
             AppearanceItem::Lighting => 0,
-            AppearanceItem::SurfaceColor => 1,
-            AppearanceItem::Resolution => 2,
-            AppearanceItem::AutoRotate => 3,
+            AppearanceItem::Resolution => 1,
+            AppearanceItem::AutoRotate => 2,
         }
     }
 
     pub fn from_index(index: u8) -> AppearanceItem {
         match index {
             0 => AppearanceItem::Lighting,
-            1 => AppearanceItem::SurfaceColor,
-            2 => AppearanceItem::Resolution,
+            1 => AppearanceItem::Resolution,
             _ => AppearanceItem::AutoRotate,
         }
     }
@@ -485,15 +482,6 @@ impl SettingsState {
             return SettingsAction::Redraw;
         }
         if self.page == SettingsPage::Appearance {
-            if self.selected_appearance_item() == AppearanceItem::SurfaceColor
-                && options.surface_palette == SurfacePalette::Custom
-            {
-                self.page = SettingsPage::CustomColor;
-                self.custom_color_index = 0;
-                self.custom_color_draft = options.custom_rgb;
-                self.numeric.reset();
-                return SettingsAction::Redraw;
-            }
             return self.adjust_appearance(options, true);
         }
 
@@ -647,13 +635,6 @@ impl SettingsState {
                     options.lighting.next()
                 } else {
                     options.lighting.previous()
-                };
-            }
-            AppearanceItem::SurfaceColor => {
-                options.surface_palette = if right {
-                    options.surface_palette.next()
-                } else {
-                    options.surface_palette.previous()
                 };
             }
             AppearanceItem::Resolution => {
@@ -819,7 +800,7 @@ impl SettingsState {
     }
 }
 
-struct NumericEditor {
+pub(crate) struct NumericEditor {
     buffer: [u8; NUMERIC_CAPACITY + 1],
     length: usize,
     cursor: usize,
@@ -829,7 +810,7 @@ struct NumericEditor {
 }
 
 impl NumericEditor {
-    fn new() -> NumericEditor {
+    pub(crate) fn new() -> NumericEditor {
         NumericEditor {
             buffer: [0; NUMERIC_CAPACITY + 1],
             length: 0,
@@ -840,7 +821,7 @@ impl NumericEditor {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.buffer = [0; NUMERIC_CAPACITY + 1];
         self.length = 0;
         self.cursor = 0;
@@ -849,7 +830,7 @@ impl NumericEditor {
         self.modified = false;
     }
 
-    fn load(&mut self, value: f32) {
+    pub(crate) fn load(&mut self, value: f32) {
         self.reset();
         let text = NumberText::new(value);
         let _ = self.insert(text.as_bytes());
@@ -857,19 +838,19 @@ impl NumericEditor {
         self.modified = false;
     }
 
-    fn source(&self) -> &str {
+    pub(crate) fn source(&self) -> &str {
         match core::str::from_utf8(&self.buffer[..self.length]) {
             Ok(source) => source,
             Err(_) => "",
         }
     }
 
-    fn visible_bytes(&self) -> &[u8] {
+    pub(crate) fn visible_bytes(&self) -> &[u8] {
         let end = core::cmp::min(self.length, self.scroll + NUMERIC_VISIBLE_CHARACTERS);
         &self.buffer[self.scroll..end]
     }
 
-    fn insert(&mut self, bytes: &[u8]) -> bool {
+    pub(crate) fn insert(&mut self, bytes: &[u8]) -> bool {
         if bytes.is_empty() || bytes.len() > NUMERIC_CAPACITY - self.length {
             return false;
         }
@@ -892,7 +873,7 @@ impl NumericEditor {
         true
     }
 
-    fn backspace(&mut self) -> bool {
+    pub(crate) fn backspace(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
         }
@@ -911,7 +892,7 @@ impl NumericEditor {
         true
     }
 
-    fn clear(&mut self) -> bool {
+    pub(crate) fn clear(&mut self) -> bool {
         if self.length == 0 {
             return false;
         }
@@ -924,7 +905,7 @@ impl NumericEditor {
         true
     }
 
-    fn move_left(&mut self) -> bool {
+    pub(crate) fn move_left(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
         }
@@ -933,7 +914,7 @@ impl NumericEditor {
         true
     }
 
-    fn move_right(&mut self) -> bool {
+    pub(crate) fn move_right(&mut self) -> bool {
         if self.cursor >= self.length {
             return false;
         }
@@ -942,7 +923,7 @@ impl NumericEditor {
         true
     }
 
-    fn move_to_start(&mut self) -> bool {
+    pub(crate) fn move_to_start(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
         }
@@ -951,7 +932,7 @@ impl NumericEditor {
         true
     }
 
-    fn move_to_end(&mut self) -> bool {
+    pub(crate) fn move_to_end(&mut self) -> bool {
         if self.cursor == self.length {
             return false;
         }
@@ -1015,7 +996,7 @@ fn increment_u8(index: &mut u8, count: u8) -> SettingsAction {
 }
 
 /// Parses one Custom RGB channel without floating-point conversion.
-fn parse_color_channel(source: &[u8]) -> Option<u8> {
+pub(crate) fn parse_color_channel(source: &[u8]) -> Option<u8> {
     if source.is_empty() {
         return None;
     }
@@ -1137,14 +1118,11 @@ mod tests {
     }
 
     fn enter_custom_color(state: &mut SettingsState, options: &mut GraphOptions) {
-        enter_appearance(state, options);
-        assert_eq!(state.select_next(), SettingsAction::Redraw);
         options.surface_palette = SurfacePalette::Custom;
-        assert_eq!(
-            state.activate(options, Domain::DEFAULT),
-            SettingsAction::Redraw
-        );
-        assert_eq!(state.page(), SettingsPage::CustomColor);
+        state.page = SettingsPage::CustomColor;
+        state.custom_color_index = 0;
+        state.custom_color_draft = options.custom_rgb;
+        state.numeric.reset();
     }
 
     fn replace_edit_text(state: &mut SettingsState, domain: Domain, events: &[event::Event]) {
@@ -1234,21 +1212,14 @@ mod tests {
         );
         assert_eq!(options.lighting, LightingPreset::Strong);
         assert_eq!(state.select_next(), SettingsAction::Redraw);
-        assert_eq!(
-            state.selected_appearance_item(),
-            AppearanceItem::SurfaceColor
-        );
-        assert_eq!(
-            state.adjust_left(&mut options),
-            SettingsAction::GraphChanged
-        );
-        assert_eq!(options.surface_palette, SurfacePalette::Custom);
-        assert_eq!(state.select_next(), SettingsAction::Redraw);
         assert_eq!(state.selected_appearance_item(), AppearanceItem::Resolution);
         assert_eq!(
-            state.adjust_right(&mut options),
+            state.adjust_left(&mut options),
             SettingsAction::ResolutionChanged
         );
+        assert_eq!(options.resolution, crate::surface::ResolutionPreset::Low);
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(state.selected_appearance_item(), AppearanceItem::AutoRotate);
         assert_eq!(state.back(), SettingsAction::Redraw);
         assert_eq!(state.page(), SettingsPage::Main);
     }
@@ -1274,7 +1245,6 @@ mod tests {
             state.activate(&mut options, Domain::DEFAULT),
             SettingsAction::Redraw
         );
-        assert_eq!(state.select_next(), SettingsAction::Redraw);
         assert_eq!(state.select_next(), SettingsAction::Redraw);
         assert_eq!(state.selected_appearance_item(), AppearanceItem::Resolution);
         assert_eq!(

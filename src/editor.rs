@@ -229,6 +229,29 @@ impl EquationEditor {
         editor
     }
 
+    /// Replaces the complete editor draft from one function slot.
+    ///
+    /// Function switching uses one reusable editor. Loading is bounded by the
+    /// same 96-byte compiler limit and always resets cursor/scroll/modal state.
+    pub fn load_source(&mut self, source: &[u8]) {
+        self.buffer = [0; MAX_EXPRESSION_LENGTH];
+        self.length = core::cmp::min(source.len(), MAX_EXPRESSION_LENGTH);
+        self.buffer[..self.length].copy_from_slice(&source[..self.length]);
+        self.cursor = self.length;
+        self.scroll = self.length.saturating_sub(VISIBLE_CHARACTERS);
+        self.error = None;
+        self.picker_open = false;
+        self.picker_column = 0;
+        self.picker_row = 0;
+    }
+
+    /// Copies the active draft into fixed slot storage and returns its length.
+    pub fn copy_source_into(&self, destination: &mut [u8; MAX_EXPRESSION_LENGTH]) -> u8 {
+        *destination = [0; MAX_EXPRESSION_LENGTH];
+        destination[..self.length].copy_from_slice(&self.buffer[..self.length]);
+        self.length as u8
+    }
+
     /// Returns the current ASCII source as UTF-8 without allocating.
     pub fn source(&self) -> &str {
         match core::str::from_utf8(&self.buffer[..self.length]) {

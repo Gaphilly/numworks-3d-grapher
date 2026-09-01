@@ -487,6 +487,11 @@ mod tests {
     }
 
     #[test]
+    fn app_state_storage_remains_bounded() {
+        assert_eq!(core::mem::size_of::<AppState>(), 312);
+    }
+
+    #[test]
     fn camera_motion_invalidates_projection_but_not_surface_samples() {
         let mut app = AppState::new();
         app.dirty.content = false;
@@ -555,6 +560,70 @@ mod tests {
             app.settings.page(),
             crate::settings::SettingsPage::Appearance
         );
+    }
+
+    #[test]
+    fn custom_color_apply_dirties_graph_without_resampling() {
+        let mut app = AppState::new();
+        enter_settings(&mut app);
+        let _ = app.update(key(keyboard::EXE));
+        release(&mut app);
+        let _ = app.update(key(keyboard::DOWN));
+        release(&mut app);
+        let _ = app.update(key(keyboard::LEFT));
+        release(&mut app);
+        assert_eq!(
+            app.graph_options.surface_palette,
+            crate::graph::SurfacePalette::Custom
+        );
+        let original = app.graph_options.custom_rgb;
+        let _ = app.update(key(keyboard::EXE));
+        release(&mut app);
+        assert_eq!(
+            app.settings.page(),
+            crate::settings::SettingsPage::CustomColor
+        );
+
+        let _ = app.update(key(keyboard::RIGHT));
+        release(&mut app);
+        assert_eq!(app.graph_options.custom_rgb, original);
+        settings_move_down(&mut app, 3);
+        app.dirty.content = false;
+        app.dirty.graph = false;
+        app.dirty.surface = false;
+        let _ = app.update(key(keyboard::EXE));
+        assert_eq!(app.graph_options.custom_rgb.red, original.red + 8);
+        assert!(app.dirty.content);
+        assert!(app.dirty.graph);
+        assert!(!app.dirty.surface);
+    }
+
+    #[test]
+    fn custom_color_ok_focuses_tabs_without_committing_draft() {
+        let mut app = AppState::new();
+        enter_settings(&mut app);
+        let _ = app.update(key(keyboard::EXE));
+        release(&mut app);
+        let _ = app.update(key(keyboard::DOWN));
+        release(&mut app);
+        let _ = app.update(key(keyboard::LEFT));
+        release(&mut app);
+        let original = app.graph_options.custom_rgb;
+        let _ = app.update(key(keyboard::EXE));
+        release(&mut app);
+        let _ = app.update(key(keyboard::RIGHT));
+        release(&mut app);
+
+        assert!(matches!(
+            app.update(key(keyboard::OK)),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.focus, Focus::Tabs);
+        assert_eq!(
+            app.settings.page(),
+            crate::settings::SettingsPage::CustomColor
+        );
+        assert_eq!(app.graph_options.custom_rgb, original);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::editor::{EquationEditor, VISIBLE_CHARACTERS};
 use crate::expression::ParseError;
 use crate::graph::{GraphOptions, LightingPreset, RenderingMode, SurfacePalette};
 use crate::settings::{
-    AppearanceItem, DomainField, NumberText, NumericError, SettingsItem, SettingsPage,
-    SettingsState, NUMERIC_VISIBLE_CHARACTERS,
+    AppearanceItem, CustomColorItem, DomainField, NumberText, NumericError, SettingsItem,
+    SettingsPage, SettingsState, NUMERIC_VISIBLE_CHARACTERS,
 };
 use crate::surface::{Domain, DomainError};
 
@@ -38,7 +38,7 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.3.0\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.4.0\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
@@ -233,6 +233,7 @@ pub fn draw_settings(
         SettingsPage::Main => draw_settings_menu(settings, options, focused),
         SettingsPage::Domain => draw_domain_settings(settings, domain, focused),
         SettingsPage::Appearance => draw_appearance_settings(settings, options, focused),
+        SettingsPage::CustomColor => draw_custom_color_settings(settings, focused),
     }
     eadk::display::draw_string(
         APPLICATION_DISPLAY_VERSION,
@@ -464,7 +465,183 @@ fn appearance_value(item: AppearanceItem, options: GraphOptions) -> (&'static [u
             SurfacePalette::Orange => (b"Orange\0", 263),
             SurfacePalette::Purple => (b"Purple\0", 263),
             SurfacePalette::Gray => (b"Gray\0", 277),
+            SurfacePalette::Red => (b"Red\0", 284),
+            SurfacePalette::Cyan => (b"Cyan\0", 277),
+            SurfacePalette::Yellow => (b"Yellow\0", 263),
+            SurfacePalette::White => (b"White\0", 270),
+            SurfacePalette::Custom => (b"Custom\0", 263),
         },
+    }
+}
+
+const CUSTOM_COLOR_LABELS: [&[u8]; 4] = [b"Red\0", b"Green\0", b"Blue\0", b"Apply\0"];
+const CUSTOM_COLOR_ROW_TOP: u16 = 52;
+const CUSTOM_COLOR_ROW_HEIGHT: u16 = 31;
+const CUSTOM_COLOR_FIELD_X: u16 = 102;
+const CUSTOM_COLOR_FIELD_WIDTH: u16 = 92;
+
+fn draw_custom_color_settings(settings: &SettingsState, focused: bool) {
+    eadk::display::draw_string(
+        b"Custom color\0",
+        Point { x: 12, y: 31 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    eadk::display::draw_string(
+        b"Preview\0",
+        Point { x: 210, y: 31 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    let draft = settings.custom_color_draft();
+    eadk::display::push_rect_uniform(
+        Rect {
+            x: 270,
+            y: 31,
+            width: 36,
+            height: 17,
+        },
+        Color {
+            rgb565: draft.to_rgb565(),
+        },
+    );
+    draw_field_border(269, 30, 38, 19, DARK_GRAY);
+
+    let selected = settings.selected_custom_color_item().index();
+    let mut row = 0;
+    while row < CUSTOM_COLOR_LABELS.len() {
+        let item = CustomColorItem::from_index(row as u8);
+        let top = CUSTOM_COLOR_ROW_TOP + row as u16 * CUSTOM_COLOR_ROW_HEIGHT;
+        let is_selected = row == selected;
+        let background = if is_selected { FIELD_BACKGROUND } else { WHITE };
+        eadk::display::push_rect_uniform(
+            Rect {
+                x: 12,
+                y: top,
+                width: 182,
+                height: 25,
+            },
+            background,
+        );
+        if is_selected {
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: 12,
+                    y: top,
+                    width: 3,
+                    height: 25,
+                },
+                if focused { ORANGE } else { DARK_GRAY },
+            );
+        }
+        eadk::display::draw_string(
+            CUSTOM_COLOR_LABELS[row],
+            Point { x: 20, y: top + 4 },
+            false,
+            BLACK,
+            background,
+        );
+        if item == CustomColorItem::Apply {
+            eadk::display::draw_string(
+                b"EXE\0",
+                Point { x: 157, y: top + 4 },
+                false,
+                if is_selected { BLUE } else { DARK_GRAY },
+                background,
+            );
+        } else {
+            draw_custom_color_field(settings, item, draft, top, is_selected, focused);
+        }
+        row += 1;
+    }
+
+    let message = match settings.error() {
+        Some(error) => numeric_error_message(error),
+        None if settings.is_editing() => b"EXE: set channel   Back: cancel\0",
+        None => b"Left/Right: +/-8   EXE: edit/apply\0",
+    };
+    eadk::display::draw_string(
+        message,
+        Point { x: 12, y: 181 },
+        false,
+        if settings.error().is_some() {
+            Color { rgb565: 0xb800 }
+        } else {
+            DARK_GRAY
+        },
+        WHITE,
+    );
+}
+
+fn draw_custom_color_field(
+    settings: &SettingsState,
+    item: CustomColorItem,
+    draft: crate::graph::Rgb888,
+    top: u16,
+    selected: bool,
+    focused: bool,
+) {
+    let background = if selected { FIELD_BACKGROUND } else { WHITE };
+    let editing = selected && settings.is_editing();
+    if selected {
+        draw_field_border(
+            CUSTOM_COLOR_FIELD_X,
+            top + 1,
+            CUSTOM_COLOR_FIELD_WIDTH,
+            23,
+            if focused { BLUE } else { DARK_GRAY },
+        );
+    }
+    if editing {
+        let mut visible = [0_u8; NUMERIC_VISIBLE_CHARACTERS + 1];
+        let bytes = settings.edit_visible_bytes();
+        let mut index = 0;
+        while index < bytes.len() && index < NUMERIC_VISIBLE_CHARACTERS {
+            visible[index] = bytes[index];
+            index += 1;
+        }
+        eadk::display::draw_string(
+            &visible,
+            Point {
+                x: CUSTOM_COLOR_FIELD_X + 5,
+                y: top + 4,
+            },
+            false,
+            BLACK,
+            background,
+        );
+        if focused {
+            let cursor_column = settings.edit_cursor() - settings.edit_scroll();
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x: CUSTOM_COLOR_FIELD_X + 5 + cursor_column as u16 * SMALL_FONT_CHARACTER_WIDTH,
+                    y: top + 20,
+                    width: 6,
+                    height: 2,
+                },
+                BLUE,
+            );
+        }
+    } else {
+        let value = match item {
+            CustomColorItem::Red => draft.red,
+            CustomColorItem::Green => draft.green,
+            CustomColorItem::Blue => draft.blue,
+            CustomColorItem::Apply => 0,
+        };
+        let text = NumberText::new(value as f32);
+        eadk::display::draw_string(
+            text.as_c_string(),
+            Point {
+                x: CUSTOM_COLOR_FIELD_X + 5,
+                y: top + 4,
+            },
+            false,
+            if selected { BLUE } else { DARK_GRAY },
+            background,
+        );
     }
 }
 
@@ -651,6 +828,7 @@ fn numeric_error_message(error: NumericError) -> &'static [u8] {
         NumericError::Domain(DomainError::Inverted) => b"Minimum must be below maximum\0",
         NumericError::Domain(DomainError::TooNarrow) => b"Domain is too narrow\0",
         NumericError::Domain(DomainError::TooLarge) => b"Domain is too large\0",
+        NumericError::ColorOutOfRange => b"Enter an integer from 0 to 255\0",
     }
 }
 
@@ -688,7 +866,7 @@ mod tests {
 
     #[test]
     fn displayed_release_version_remains_manually_fixed() {
-        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.3.0\0");
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.4.0\0");
     }
 
     #[test]

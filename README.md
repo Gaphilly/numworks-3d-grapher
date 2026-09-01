@@ -9,7 +9,7 @@ The project targets `thumbv7em-none-eabihf` (the calculator's Cortex-M7-class Th
 - Two surface modes: **Wireframe** and **Solid**
 - The original 25×19 wireframe renderer remains the startup default and UX/performance baseline
 - Cached fixed-world-light Lambert diffuse levels with Standard, Soft, and Strong tone presets
-- Five Solid palettes: Blue, Green, Orange, Purple, and Gray
+- Ten Solid color choices: Blue, Green, Orange, Purple, Gray, Red, Cyan, Yellow, White, and a user-editable Custom RGB color
 - Band-local depth testing for filled triangles
 - Configurable ground grid, axes, ticks, coordinate labels, rectangular XY domain, and camera reset
 - `f32` expression compiler/evaluator supporting constants, `x`, `y`, arithmetic, power, parentheses, unary minus, and `sin`, `cos`, `tan`, `sqrt`, and `abs`
@@ -92,7 +92,11 @@ Rendering and visibility changes only invalidate graph composition. Camera reset
 
 ### Appearance page
 
-Appearance provides two bounded Solid-only settings: **Lighting** (`Standard`, `Soft`, or `Strong`) and **Surface color** (`Blue`, `Green`, `Orange`, `Purple`, or `Gray`). Up/Down selects a row, Left/Right or EXE cycles its value, and Back returns to the main Settings page. These options select flash-resident lookup tables; they do not resample the surface, alter depth, or affect Wireframe.
+Appearance provides two bounded Solid-only settings: **Lighting** (`Standard`, `Soft`, or `Strong`) and **Surface color** (`Blue`, `Green`, `Orange`, `Purple`, `Gray`, `Red`, `Cyan`, `Yellow`, `White`, or `Custom`). Up/Down selects a row, Left/Right cycles its value, and Back returns to the main Settings page. EXE retains forward cycling for built-in colors and opens the Custom Color page when Custom is selected.
+
+The Custom Color page edits Red, Green, and Blue channels in `0..=255`. Left/Right adjusts the temporary channel by eight, while EXE opens the existing fixed 24-byte numeric editor for an exact value. Nothing becomes active until EXE on **Apply**; Back cancels a channel draft or the complete Custom Color draft. The page includes an RGB565 preview, uses no heap, and never starts a blocking input loop.
+
+Lighting and color remain independent. Appearance changes invalidate graph composition but do not resample the expression, rebuild triangle normals, alter camera/depth state, or affect Wireframe.
 
 ### Domain page
 
@@ -141,7 +145,7 @@ regular height-field traversal + bounded axes/grid/labels
 27 EADK graph-viewport transfers
 ```
 
-The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Lambert diffuse light and triangle validity are calculated once when the surface is sampled, never during a camera-only Solid redraw. Three ambient/diffuse curves and five base colors are combined into 15 compile-time RGB565 tables, keeping normal camera redraws to one indexed color lookup per triangle setup with no floating-point color work.
+The renderer visits the 24×18 cells directly as 864 consistently wound triangles; it never constructs a general mesh, scene graph, ECS, or other graphics framework. Lambert diffuse light and triangle validity are calculated once when the surface is sampled, never during a camera-only Solid redraw. Three ambient/diffuse curves and nine built-in base colors are combined into 27 compile-time RGB565 tables. Custom RGB uses one persistent 256-entry table that is regenerated only after its RGB value or lighting preset changes. Camera-only redraws reuse the selected table and retain one indexed color lookup per triangle setup with no per-pixel RGB arithmetic or floating-point color work.
 
 The input/UI path is deliberately split:
 
@@ -166,7 +170,8 @@ There is no allocator and no heap-backed collection. Rendering storage is fixed-
 | RGB565 color band | 320×8×2 = 5,120 bytes | Every graph render path |
 | Solid inverse-depth band | 320×8×2 = 5,120 bytes | Solid modes only |
 | Surface cache | 1,900-byte heights + 176-byte X/Y coordinates + 864-byte triangle light/validity cache | Active graph |
-| Solid appearance tables | 15×256×2 = 7,680 bytes | Static flash/rodata; no RAM or stack allocation |
+| Built-in Solid appearance tables | 27×256×2 = 13,824 bytes | Static flash/rodata; no RAM or stack allocation |
+| Active Custom appearance table | 256×2 = 512 bytes, plus a 4-byte cache key | Static writable memory; never placed in `AppState` or the Solid stack frame |
 | Wireframe projected cache | 25×19 `(i16, i16)` = 1,900 bytes | Wireframe render only |
 | Solid projected cache | 25×19 `(i16, i16, u16)` = approximately 2,850 bytes | Solid render only |
 | Expression source | 96 bytes | Equation editor state |
@@ -240,7 +245,7 @@ If a technically correct feature makes the calculator noticeably less responsive
 | `src/app.rs` | Tab/content focus state machine, graph options, domain state, and header/content/graph/surface dirty flags |
 | `src/eadk.rs` | Rust FFI layout, constants, and guarded wrappers for firmware display, keyboard, event, and timing symbols |
 | `src/editor.rs` | Fixed 96-byte Equation editor, cursor/scroll logic, calculator event mapping, and held-key repeat |
-| `src/settings.rs` | Eight-row Settings interaction, bounded Appearance submenu, optional performance readout, and fixed 24-byte transactional domain editor |
+| `src/settings.rs` | Eight-row Settings interaction, Appearance/transactional Custom RGB pages, optional performance readout, and shared fixed 24-byte numeric editor |
 | `src/expression.rs` | Streaming tokenizer, shunting-yard parser, fixed postfix bytecode, and stack evaluator |
 | `src/function.rs` | `SurfaceFunction` boundary between evaluation and sampling |
 | `src/surface.rs` | Domain validation/mapping, 25×19 sampling, cached heights/coordinates/diffuse levels, and discontinuity rejection |
@@ -303,7 +308,15 @@ The final command requires a connected calculator and begins the mandatory physi
 
 ## Version policy
 
-Settings displays the manually maintained version string **`v2.3.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+Settings displays the manually maintained version string **`v2.4.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+
+## v2.4.0 changes
+
+- Expands Solid colors to nine built-in RGB565 choices plus a transactional Custom RGB color.
+- Reuses the existing semantic numeric editor for exact `0..=255` channel entry and provides a bounded preview/apply workflow.
+- Adds 27 compile-time built-in shade tables and one persistent 512-byte Custom table, rebuilt only when Custom RGB or lighting changes.
+- Keeps cached triangle lighting palette-neutral and leaves sampling, projection, depth, the Solid pixel loop, and Wireframe unchanged.
+- Sets the manually maintained displayed/package version to 2.4.0 for this release.
 
 ## v2.3.0 changes
 

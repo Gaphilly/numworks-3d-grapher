@@ -14,9 +14,9 @@
 //! cooperative application loop.
 
 use crate::eadk::event;
-use crate::graph::GraphOptions;
+use crate::graph::{GraphOptions, Rgb888, SurfacePalette};
 #[cfg(test)]
-use crate::graph::{LightingPreset, RenderingMode, SurfacePalette};
+use crate::graph::{LightingPreset, RenderingMode};
 use crate::surface::{Domain, DomainError};
 
 /// Maximum source bytes in one domain-bound editor.
@@ -32,6 +32,10 @@ pub const SETTINGS_ITEM_COUNT: usize = 8;
 pub const DOMAIN_FIELD_COUNT: usize = 4;
 /// Number of bounded choices on the Appearance page.
 pub const APPEARANCE_ITEM_COUNT: usize = 2;
+/// Three channels plus an explicit transactional Apply row.
+pub const CUSTOM_COLOR_ITEM_COUNT: usize = 4;
+/// Coarse channel adjustment used by Left/Right outside the numeric editor.
+pub const CUSTOM_COLOR_STEP: u8 = 8;
 
 /// Settings subview currently displayed inside the Settings tab.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,6 +43,36 @@ pub enum SettingsPage {
     Main,
     Domain,
     Appearance,
+    CustomColor,
+}
+
+/// Rows in the transactional Custom RGB editor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CustomColorItem {
+    Red,
+    Green,
+    Blue,
+    Apply,
+}
+
+impl CustomColorItem {
+    pub fn index(self) -> usize {
+        match self {
+            CustomColorItem::Red => 0,
+            CustomColorItem::Green => 1,
+            CustomColorItem::Blue => 2,
+            CustomColorItem::Apply => 3,
+        }
+    }
+
+    pub fn from_index(index: u8) -> CustomColorItem {
+        match index {
+            0 => CustomColorItem::Red,
+            1 => CustomColorItem::Green,
+            2 => CustomColorItem::Blue,
+            _ => CustomColorItem::Apply,
+        }
+    }
 }
 
 /// Rows in the Solid appearance submenu.
@@ -165,6 +199,7 @@ pub enum NumericError {
     InvalidNumber,
     TooLong,
     Domain(DomainError),
+    ColorOutOfRange,
 }
 
 /// Result for the application layer to translate into dirty flags/state changes.
@@ -279,12 +314,17 @@ impl NumberText {
     }
 }
 
-/// Fixed-storage state for both Settings pages and one active numeric field.
+/// Fixed-storage state for every Settings subpage and one shared numeric field.
+///
+/// Custom RGB drafts remain separate from `GraphOptions` until Apply, so Back
+/// cannot partially change the active Solid appearance.
 pub struct SettingsState {
     page: SettingsPage,
     menu_index: usize,
     domain_index: usize,
     appearance_index: u8,
+    custom_color_index: u8,
+    custom_color_draft: Rgb888,
     editing: bool,
     numeric: NumericEditor,
 }
@@ -297,6 +337,8 @@ impl SettingsState {
             menu_index: 0,
             domain_index: 0,
             appearance_index: 0,
+            custom_color_index: 0,
+            custom_color_draft: Rgb888::DEFAULT_CUSTOM,
             editing: false,
             numeric: NumericEditor::new(),
         }
@@ -320,6 +362,16 @@ impl SettingsState {
     /// Selected row on the bounded Solid appearance page.
     pub fn selected_appearance_item(&self) -> AppearanceItem {
         AppearanceItem::from_index(self.appearance_index)
+    }
+
+    /// Selected R/G/B/Apply row in the transactional Custom Color page.
+    pub fn selected_custom_color_item(&self) -> CustomColorItem {
+        CustomColorItem::from_index(self.custom_color_index)
+    }
+
+    /// Temporary RGB value shown by the Custom Color page and preview.
+    pub fn custom_color_draft(&self) -> Rgb888 {
+        self.custom_color_draft
     }
 
     /// Whether semantic events currently belong to the numeric field.
@@ -362,6 +414,7 @@ impl SettingsState {
             SettingsPage::Main => decrement(&mut self.menu_index),
             SettingsPage::Domain => decrement(&mut self.domain_index),
             SettingsPage::Appearance => decrement_u8(&mut self.appearance_index),
+            SettingsPage::CustomColor => decrement_u8(&mut self.custom_color_index),
         }
     }
 
@@ -375,6 +428,9 @@ impl SettingsState {
             SettingsPage::Domain => increment(&mut self.domain_index, DOMAIN_FIELD_COUNT),
             SettingsPage::Appearance => {
                 increment_u8(&mut self.appearance_index, APPEARANCE_ITEM_COUNT as u8)
+            }
+            SettingsPage::CustomColor => {
+                increment_u8(&mut self.custom_color_index, CUSTOM_COLOR_ITEM_COUNT as u8)
             }
         }
     }
@@ -405,7 +461,30 @@ impl SettingsState {
             self.begin_domain_edit(active_domain);
             return SettingsAction::Redraw;
         }
+        if self.page == SettingsPage::CustomColor {
+            if self.editing {
+                return self.submit_custom_channel();
+            }
+            if self.selected_custom_color_item() == CustomColorItem::Apply {
+                options.custom_rgb = self.custom_color_draft;
+                options.surface_palette = SurfacePalette::Custom;
+                self.page = SettingsPage::Appearance;
+                self.numeric.reset();
+                return SettingsAction::GraphChanged;
+            }
+            self.begin_custom_channel_edit();
+            return SettingsAction::Redraw;
+        }
         if self.page == SettingsPage::Appearance {
+            if self.selected_appearance_item() == AppearanceItem::SurfaceColor
+                && options.surface_palette == SurfacePalette::Custom
+            {
+                self.page = SettingsPage::CustomColor;
+                self.custom_color_index = 0;
+                self.custom_color_draft = options.custom_rgb;
+                self.numeric.reset();
+                return SettingsAction::Redraw;
+            }
             return self.adjust_appearance(options, true);
         }
 
@@ -452,6 +531,11 @@ impl SettingsState {
             self.numeric.reset();
             return SettingsAction::Redraw;
         }
+        if self.page == SettingsPage::CustomColor {
+            self.page = SettingsPage::Appearance;
+            self.numeric.reset();
+            return SettingsAction::Redraw;
+        }
         if self.page == SettingsPage::Domain || self.page == SettingsPage::Appearance {
             self.page = SettingsPage::Main;
             self.numeric.reset();
@@ -481,7 +565,13 @@ impl SettingsState {
             event::BACKSPACE => self.numeric_backspace(),
             event::CLEAR => self.numeric_clear(),
             event::BACK => self.back(),
-            event::EXE => self.submit_domain(active_domain),
+            event::EXE => {
+                if self.page == SettingsPage::CustomColor {
+                    self.submit_custom_channel()
+                } else {
+                    self.submit_domain(active_domain)
+                }
+            }
             event::ZERO => self.numeric_insert(b"0"),
             event::ONE => self.numeric_insert(b"1"),
             event::TWO => self.numeric_insert(b"2"),
@@ -492,10 +582,10 @@ impl SettingsState {
             event::SEVEN => self.numeric_insert(b"7"),
             event::EIGHT => self.numeric_insert(b"8"),
             event::NINE => self.numeric_insert(b"9"),
-            event::DOT => self.numeric_insert(b"."),
-            event::MINUS => self.numeric_insert(b"-"),
-            event::PLUS => self.numeric_insert(b"+"),
-            event::EE => self.numeric_insert(b"e"),
+            event::DOT if self.page != SettingsPage::CustomColor => self.numeric_insert(b"."),
+            event::MINUS if self.page != SettingsPage::CustomColor => self.numeric_insert(b"-"),
+            event::PLUS if self.page != SettingsPage::CustomColor => self.numeric_insert(b"+"),
+            event::EE if self.page != SettingsPage::CustomColor => self.numeric_insert(b"e"),
             _ => SettingsAction::None,
         }
     }
@@ -506,6 +596,9 @@ impl SettingsState {
         }
         if self.page == SettingsPage::Appearance {
             return self.adjust_appearance(options, right);
+        }
+        if self.page == SettingsPage::CustomColor {
+            return self.adjust_custom_color(right);
         }
         if self.page != SettingsPage::Main {
             return SettingsAction::None;
@@ -562,6 +655,67 @@ impl SettingsState {
         let value = self.selected_domain_field().value(active_domain);
         self.numeric.load(value);
         self.editing = true;
+    }
+
+    fn begin_custom_channel_edit(&mut self) {
+        let value = self.custom_channel_value();
+        self.numeric.load(value as f32);
+        self.editing = true;
+    }
+
+    fn submit_custom_channel(&mut self) -> SettingsAction {
+        if !self.numeric.modified {
+            self.editing = false;
+            self.numeric.reset();
+            return SettingsAction::Redraw;
+        }
+        let value = match parse_color_channel(self.numeric.source().as_bytes()) {
+            Some(value) => value,
+            None => {
+                self.numeric.error = Some(NumericError::ColorOutOfRange);
+                return SettingsAction::Redraw;
+            }
+        };
+        self.set_custom_channel_value(value);
+        self.editing = false;
+        self.numeric.reset();
+        SettingsAction::Redraw
+    }
+
+    fn adjust_custom_color(&mut self, right: bool) -> SettingsAction {
+        if self.selected_custom_color_item() == CustomColorItem::Apply {
+            return SettingsAction::None;
+        }
+        let current = self.custom_channel_value();
+        let adjusted = if right {
+            current.saturating_add(CUSTOM_COLOR_STEP)
+        } else {
+            current.saturating_sub(CUSTOM_COLOR_STEP)
+        };
+        if adjusted == current {
+            SettingsAction::None
+        } else {
+            self.set_custom_channel_value(adjusted);
+            SettingsAction::Redraw
+        }
+    }
+
+    fn custom_channel_value(&self) -> u8 {
+        match self.selected_custom_color_item() {
+            CustomColorItem::Red => self.custom_color_draft.red,
+            CustomColorItem::Green => self.custom_color_draft.green,
+            CustomColorItem::Blue => self.custom_color_draft.blue,
+            CustomColorItem::Apply => 0,
+        }
+    }
+
+    fn set_custom_channel_value(&mut self, value: u8) {
+        match self.selected_custom_color_item() {
+            CustomColorItem::Red => self.custom_color_draft.red = value,
+            CustomColorItem::Green => self.custom_color_draft.green = value,
+            CustomColorItem::Blue => self.custom_color_draft.blue = value,
+            CustomColorItem::Apply => {}
+        }
     }
 
     fn submit_domain(&mut self, active_domain: Domain) -> SettingsAction {
@@ -842,6 +996,29 @@ fn increment_u8(index: &mut u8, count: u8) -> SettingsAction {
     }
 }
 
+/// Parses one Custom RGB channel without floating-point conversion.
+fn parse_color_channel(source: &[u8]) -> Option<u8> {
+    if source.is_empty() {
+        return None;
+    }
+    let mut value = 0_u16;
+    let mut index = 0;
+    while index < source.len() {
+        let byte = source[index];
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as u16);
+        if value > u8::MAX as u16 {
+            return None;
+        }
+        index += 1;
+    }
+    Some(value as u8)
+}
+
 /// Parses the deliberately small numeric grammar accepted by a bound field:
 /// optional sign, decimal mantissa, and optional signed base-ten exponent.
 fn parse_number(source: &[u8]) -> Option<f32> {
@@ -931,6 +1108,25 @@ mod tests {
             SettingsAction::Redraw
         );
         assert_eq!(state.page(), SettingsPage::Domain);
+    }
+
+    fn enter_appearance(state: &mut SettingsState, options: &mut GraphOptions) {
+        assert_eq!(
+            state.activate(options, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert_eq!(state.page(), SettingsPage::Appearance);
+    }
+
+    fn enter_custom_color(state: &mut SettingsState, options: &mut GraphOptions) {
+        enter_appearance(state, options);
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        options.surface_palette = SurfacePalette::Custom;
+        assert_eq!(
+            state.activate(options, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert_eq!(state.page(), SettingsPage::CustomColor);
     }
 
     fn replace_edit_text(state: &mut SettingsState, domain: Domain, events: &[event::Event]) {
@@ -1028,7 +1224,7 @@ mod tests {
             state.adjust_left(&mut options),
             SettingsAction::GraphChanged
         );
-        assert_eq!(options.surface_palette, SurfacePalette::Gray);
+        assert_eq!(options.surface_palette, SurfacePalette::Custom);
         assert_eq!(state.select_next(), SettingsAction::None);
         assert_eq!(state.back(), SettingsAction::Redraw);
         assert_eq!(state.page(), SettingsPage::Main);
@@ -1042,9 +1238,159 @@ mod tests {
         options.lighting = options.lighting.previous();
         options.surface_palette = options.surface_palette.previous();
         assert_eq!(options.lighting, LightingPreset::Strong);
-        assert_eq!(options.surface_palette, SurfacePalette::Gray);
+        assert_eq!(options.surface_palette, SurfacePalette::Custom);
         assert_eq!(options.lighting.next(), LightingPreset::Standard);
         assert_eq!(options.surface_palette.next(), SurfacePalette::Blue);
+    }
+
+    #[test]
+    fn built_in_and_custom_palette_cycle_is_complete_and_bounded() {
+        let mut palette = SurfacePalette::Blue;
+        let expected = [
+            SurfacePalette::Green,
+            SurfacePalette::Orange,
+            SurfacePalette::Purple,
+            SurfacePalette::Gray,
+            SurfacePalette::Red,
+            SurfacePalette::Cyan,
+            SurfacePalette::Yellow,
+            SurfacePalette::White,
+            SurfacePalette::Custom,
+            SurfacePalette::Blue,
+        ];
+        for next in expected {
+            palette = palette.next();
+            assert_eq!(palette, next);
+        }
+        assert_eq!(SurfacePalette::Blue.previous(), SurfacePalette::Custom);
+        assert_eq!(SurfacePalette::Custom.previous(), SurfacePalette::White);
+    }
+
+    #[test]
+    fn custom_color_adjustment_is_temporary_and_saturates() {
+        let mut state = SettingsState::new();
+        let mut options = GraphOptions::DEFAULT;
+        let active = options.custom_rgb;
+        enter_custom_color(&mut state, &mut options);
+
+        assert_eq!(state.custom_color_draft(), active);
+        assert_eq!(state.adjust_right(&mut options), SettingsAction::Redraw);
+        assert_eq!(
+            state.custom_color_draft().red,
+            active.red + CUSTOM_COLOR_STEP
+        );
+        assert_eq!(options.custom_rgb, active);
+
+        let mut count = 0;
+        while state.adjust_right(&mut options) == SettingsAction::Redraw {
+            count += 1;
+            assert!(count < 40);
+        }
+        assert_eq!(state.custom_color_draft().red, 255);
+        while state.adjust_left(&mut options) == SettingsAction::Redraw {}
+        assert_eq!(state.custom_color_draft().red, 0);
+        assert_eq!(options.custom_rgb, active);
+    }
+
+    #[test]
+    fn custom_channel_numeric_edit_validates_and_apply_commits_atomically() {
+        let mut state = SettingsState::new();
+        let mut options = GraphOptions::DEFAULT;
+        let original = options.custom_rgb;
+        enter_custom_color(&mut state, &mut options);
+
+        assert_eq!(
+            state.activate(&mut options, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert!(state.is_editing());
+        assert_eq!(
+            state.handle_editor_event(event::CLEAR, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        for value in [event::TWO, event::FIVE, event::SIX] {
+            assert_eq!(
+                state.handle_editor_event(value, Domain::DEFAULT),
+                SettingsAction::Redraw
+            );
+        }
+        assert_eq!(
+            state.handle_editor_event(event::EXE, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert_eq!(state.error(), Some(NumericError::ColorOutOfRange));
+        assert!(state.is_editing());
+        assert_eq!(options.custom_rgb, original);
+
+        assert_eq!(
+            state.handle_editor_event(event::CLEAR, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        for value in [event::TWO, event::FIVE, event::FIVE] {
+            assert_eq!(
+                state.handle_editor_event(value, Domain::DEFAULT),
+                SettingsAction::Redraw
+            );
+        }
+        assert_eq!(
+            state.handle_editor_event(event::EXE, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert!(!state.is_editing());
+        assert_eq!(state.custom_color_draft().red, 255);
+        assert_eq!(options.custom_rgb, original);
+
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(state.selected_custom_color_item(), CustomColorItem::Apply);
+        assert_eq!(
+            state.activate(&mut options, Domain::DEFAULT),
+            SettingsAction::GraphChanged
+        );
+        assert_eq!(state.page(), SettingsPage::Appearance);
+        assert_eq!(options.custom_rgb.red, 255);
+        assert_eq!(options.custom_rgb.green, original.green);
+        assert_eq!(options.custom_rgb.blue, original.blue);
+        assert_eq!(options.surface_palette, SurfacePalette::Custom);
+    }
+
+    #[test]
+    fn custom_color_back_cancels_channel_then_whole_draft() {
+        let mut state = SettingsState::new();
+        let mut options = GraphOptions::DEFAULT;
+        let original = options.custom_rgb;
+        enter_custom_color(&mut state, &mut options);
+        assert_eq!(state.adjust_left(&mut options), SettingsAction::Redraw);
+        assert_ne!(state.custom_color_draft(), original);
+
+        assert_eq!(
+            state.activate(&mut options, Domain::DEFAULT),
+            SettingsAction::Redraw
+        );
+        assert!(state.is_editing());
+        assert_eq!(state.back(), SettingsAction::Redraw);
+        assert!(!state.is_editing());
+        assert_eq!(state.page(), SettingsPage::CustomColor);
+        assert_eq!(state.back(), SettingsAction::Redraw);
+        assert_eq!(state.page(), SettingsPage::Appearance);
+        assert_eq!(options.custom_rgb, original);
+    }
+
+    #[test]
+    fn color_channel_parser_accepts_only_zero_through_255() {
+        assert_eq!(parse_color_channel(b"0"), Some(0));
+        assert_eq!(parse_color_channel(b"255"), Some(255));
+        assert_eq!(parse_color_channel(b"00128"), Some(128));
+        assert_eq!(parse_color_channel(b""), None);
+        assert_eq!(parse_color_channel(b"256"), None);
+        assert_eq!(parse_color_channel(b"-1"), None);
+        assert_eq!(parse_color_channel(b"1.0"), None);
+    }
+
+    #[test]
+    fn settings_state_storage_remains_bounded() {
+        assert_eq!(core::mem::size_of::<SettingsState>(), 80);
     }
 
     #[test]

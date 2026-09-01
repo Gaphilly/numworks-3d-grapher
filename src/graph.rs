@@ -41,6 +41,7 @@ impl RenderingMode {
 ///
 /// These presets do not change geometry or relight the surface. They select a
 /// flash-resident RGB565 lookup table, so camera redraws retain the same cost.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LightingPreset {
     /// Restrained contrast suitable for the default calculator display view.
@@ -75,7 +76,40 @@ impl LightingPreset {
     }
 }
 
+/// An allocation-free RGB888 color used only to configure Solid shading.
+///
+/// Rendering converts this value into a bounded RGB565 lookup table when the
+/// custom color changes. Camera redraws never perform RGB888 conversion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rgb888 {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl Rgb888 {
+    /// Initial editable color. It remains independent from the built-in Blue.
+    pub const DEFAULT_CUSTOM: Rgb888 = Rgb888 {
+        red: 128,
+        green: 192,
+        blue: 255,
+    };
+
+    /// Converts eight-bit channels to RGB565 using deterministic truncation.
+    pub const fn to_rgb565(self) -> u16 {
+        ((self.red as u16 & 0xf8) << 8)
+            | ((self.green as u16 & 0xfc) << 3)
+            | ((self.blue as u16) >> 3)
+    }
+
+    /// Compact identity used to decide whether the persistent Custom LUT is current.
+    pub const fn packed(self) -> u32 {
+        ((self.red as u32) << 16) | ((self.green as u32) << 8) | self.blue as u32
+    }
+}
+
 /// Solid-only base colors. Wireframe deliberately retains its released color.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SurfacePalette {
     Blue,
@@ -83,10 +117,15 @@ pub enum SurfacePalette {
     Orange,
     Purple,
     Gray,
+    Red,
+    Cyan,
+    Yellow,
+    White,
+    Custom,
 }
 
 impl SurfacePalette {
-    pub const COUNT: usize = 5;
+    pub const BUILTIN_COUNT: usize = 9;
 
     pub fn next(self) -> SurfacePalette {
         match self {
@@ -94,33 +133,56 @@ impl SurfacePalette {
             SurfacePalette::Green => SurfacePalette::Orange,
             SurfacePalette::Orange => SurfacePalette::Purple,
             SurfacePalette::Purple => SurfacePalette::Gray,
-            SurfacePalette::Gray => SurfacePalette::Blue,
+            SurfacePalette::Gray => SurfacePalette::Red,
+            SurfacePalette::Red => SurfacePalette::Cyan,
+            SurfacePalette::Cyan => SurfacePalette::Yellow,
+            SurfacePalette::Yellow => SurfacePalette::White,
+            SurfacePalette::White => SurfacePalette::Custom,
+            SurfacePalette::Custom => SurfacePalette::Blue,
         }
     }
 
     pub fn previous(self) -> SurfacePalette {
         match self {
-            SurfacePalette::Blue => SurfacePalette::Gray,
+            SurfacePalette::Blue => SurfacePalette::Custom,
             SurfacePalette::Green => SurfacePalette::Blue,
             SurfacePalette::Orange => SurfacePalette::Green,
             SurfacePalette::Purple => SurfacePalette::Orange,
             SurfacePalette::Gray => SurfacePalette::Purple,
+            SurfacePalette::Red => SurfacePalette::Gray,
+            SurfacePalette::Cyan => SurfacePalette::Red,
+            SurfacePalette::Yellow => SurfacePalette::Cyan,
+            SurfacePalette::White => SurfacePalette::Yellow,
+            SurfacePalette::Custom => SurfacePalette::White,
         }
     }
 
     pub const fn index(self) -> usize {
         self as usize
     }
+
+    /// Index into the flash-resident built-in tables, or `None` for Custom.
+    pub const fn builtin_index(self) -> Option<usize> {
+        if self.index() < Self::BUILTIN_COUNT {
+            Some(self.index())
+        } else {
+            None
+        }
+    }
 }
 
 /// Solid base colors indexed by [`SurfacePalette`]. Tone mapping is performed
 /// by compile-time tables in the renderer, not by per-pixel channel arithmetic.
-pub const SOLID_SURFACE_COLORS: [u16; SurfacePalette::COUNT] = [
+pub const SOLID_SURFACE_COLORS: [u16; SurfacePalette::BUILTIN_COUNT] = [
     0x2d9f, // Blue: released Solid base color.
     0x2da5, // Green.
     0xfd20, // Orange.
     0x881f, // Purple.
     0x9cf3, // Gray.
+    0xf800, // Red.
+    0x07ff, // Cyan.
+    0xffe0, // Yellow.
+    0xffff, // White.
 ];
 
 /// Persistent graph-appearance options. These are tiny value types and changing
@@ -133,6 +195,8 @@ pub struct GraphOptions {
     pub lighting: LightingPreset,
     /// Solid-only RGB565 base tint.
     pub surface_palette: SurfacePalette,
+    /// User-maintained RGB888 base used when `surface_palette` is Custom.
+    pub custom_rgb: Rgb888,
     /// World-space grid on the XY plane; distinct from the solid surface mesh.
     pub show_grid: bool,
     /// World-space X/Y/Z axes and origin.
@@ -151,6 +215,7 @@ impl GraphOptions {
         rendering_mode: RenderingMode::Wireframe,
         lighting: LightingPreset::Standard,
         surface_palette: SurfacePalette::Blue,
+        custom_rgb: Rgb888::DEFAULT_CUSTOM,
         show_grid: true,
         show_axes: true,
         show_ticks: true,
@@ -336,5 +401,70 @@ mod tests {
         assert_eq!(RenderingMode::Wireframe.next(), RenderingMode::Solid);
         assert_eq!(RenderingMode::Solid.next(), RenderingMode::Wireframe);
         assert_eq!(RenderingMode::Wireframe.previous(), RenderingMode::Solid);
+    }
+
+    #[test]
+    fn rgb888_conversion_uses_bounded_rgb565_channels() {
+        assert_eq!(
+            Rgb888 {
+                red: 0,
+                green: 0,
+                blue: 0
+            }
+            .to_rgb565(),
+            0x0000
+        );
+        assert_eq!(
+            Rgb888 {
+                red: 255,
+                green: 255,
+                blue: 255
+            }
+            .to_rgb565(),
+            0xffff
+        );
+        assert_eq!(
+            Rgb888 {
+                red: 255,
+                green: 0,
+                blue: 0
+            }
+            .to_rgb565(),
+            0xf800
+        );
+        assert_eq!(
+            Rgb888 {
+                red: 0,
+                green: 255,
+                blue: 0
+            }
+            .to_rgb565(),
+            0x07e0
+        );
+        assert_eq!(
+            Rgb888 {
+                red: 0,
+                green: 0,
+                blue: 255
+            }
+            .to_rgb565(),
+            0x001f
+        );
+        assert_eq!(
+            Rgb888 {
+                red: 128,
+                green: 192,
+                blue: 255
+            }
+            .to_rgb565(),
+            0x861f
+        );
+    }
+
+    #[test]
+    fn graph_options_keep_the_expected_compact_layout() {
+        assert_eq!(core::mem::size_of::<Rgb888>(), 3);
+        assert_eq!(core::mem::size_of::<GraphOptions>(), 11);
+        assert_eq!(GraphOptions::DEFAULT.custom_rgb, Rgb888::DEFAULT_CUSTOM);
     }
 }

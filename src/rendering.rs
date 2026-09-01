@@ -17,7 +17,7 @@
 use crate::camera::{Camera, ProjectedLine, ProjectedPoint, Projector, ScreenPoint};
 use crate::eadk::{self, Color, Point, Rect};
 use crate::graph::{
-    self, AxisVisibility, GraphOptions, LightingPreset, RenderingMode, SurfacePalette,
+    self, AxisVisibility, GraphOptions, LightingPreset, RenderingMode, Rgb888, SurfacePalette,
     TickGenerator, PALETTE, SOLID_SURFACE_COLORS,
 };
 #[cfg(test)]
@@ -99,19 +99,27 @@ const AXIS_Z_GLYPH: [u8; 7] = [
 
 // Each Solid triangle caches a palette-neutral diffuse level. These complete
 // RGB565 tables combine that level with one ambient/diffuse preset and base
-// color entirely in flash. Selecting a new appearance therefore adds no RAM,
-// stack array, per-pixel arithmetic, or camera-time relighting.
+// color. Built-ins live entirely in flash. Custom uses one persistent table,
+// rebuilt only when its RGB value or lighting preset changes.
 const LIGHTING_AMBIENT: [u8; LightingPreset::COUNT] = [66, 102, 41];
-const SURFACE_SHADE_LUTS: [[[u16; 256]; SurfacePalette::COUNT]; LightingPreset::COUNT] =
+const SURFACE_SHADE_LUTS: [[[u16; 256]; SurfacePalette::BUILTIN_COUNT]; LightingPreset::COUNT] =
     build_surface_shade_luts();
 
-const fn build_surface_shade_luts() -> [[[u16; 256]; SurfacePalette::COUNT]; LightingPreset::COUNT]
-{
-    let mut tables = [[[0_u16; 256]; SurfacePalette::COUNT]; LightingPreset::COUNT];
+// This buffer is deliberately static rather than part of AppState or the Solid
+// frame. The EADK application loop is single-threaded and rendering is
+// non-reentrant: `custom_surface_shade_lut` completes every write before it
+// returns an immutable reference, and no Rust interrupt handler accesses it.
+// Those invariants are required for the narrowly contained unsafe access below.
+static mut CUSTOM_SURFACE_SHADE_LUT: [u16; 256] = [0; 256];
+static mut CUSTOM_SURFACE_SHADE_KEY: u32 = u32::MAX;
+
+const fn build_surface_shade_luts(
+) -> [[[u16; 256]; SurfacePalette::BUILTIN_COUNT]; LightingPreset::COUNT] {
+    let mut tables = [[[0_u16; 256]; SurfacePalette::BUILTIN_COUNT]; LightingPreset::COUNT];
     let mut lighting = 0;
     while lighting < LightingPreset::COUNT {
         let mut palette = 0;
-        while palette < SurfacePalette::COUNT {
+        while palette < SurfacePalette::BUILTIN_COUNT {
             tables[lighting][palette] =
                 build_shade_color_lut(SOLID_SURFACE_COLORS[palette], LIGHTING_AMBIENT[lighting]);
             palette += 1;
@@ -119,6 +127,69 @@ const fn build_surface_shade_luts() -> [[[u16; 256]; SurfacePalette::COUNT]; Lig
         lighting += 1;
     }
     tables
+}
+
+const fn custom_shade_color(base: Rgb888, ambient: u8, level: u8) -> u16 {
+    if level == 0 {
+        return 0;
+    }
+    let diffuse = level as u32 - 1;
+    let ambient = ambient as u32;
+    let intensity = ambient + ((255 - ambient) * diffuse + 127) / 254;
+    Rgb888 {
+        red: (base.red as u32 * intensity / 255) as u8,
+        green: (base.green as u32 * intensity / 255) as u8,
+        blue: (base.blue as u32 * intensity / 255) as u8,
+    }
+    .to_rgb565()
+}
+
+#[cfg(test)]
+fn build_custom_shade_lut(base: Rgb888, lighting: LightingPreset) -> [u16; 256] {
+    let mut table = [0_u16; 256];
+    let ambient = LIGHTING_AMBIENT[lighting.index()];
+    let mut level = 0;
+    while level < table.len() {
+        table[level] = custom_shade_color(base, ambient, level as u8);
+        level += 1;
+    }
+    table
+}
+
+const fn custom_shade_key(base: Rgb888, lighting: LightingPreset) -> u32 {
+    base.packed() | ((lighting.index() as u32) << 24)
+}
+
+/// Returns the persistent Custom table, refreshing it only when appearance changed.
+#[inline(never)]
+fn custom_surface_shade_lut(base: Rgb888, lighting: LightingPreset) -> &'static [u16; 256] {
+    let key = custom_shade_key(base, lighting);
+    // SAFETY: the application has one cooperative execution thread. This
+    // function is called before rasterization, is not reentrant, and the table
+    // is never mutated while the returned reference is live in `render_solid`.
+    unsafe {
+        let key_pointer = core::ptr::addr_of_mut!(CUSTOM_SURFACE_SHADE_KEY);
+        if key_pointer.read() != key {
+            let table_pointer = core::ptr::addr_of_mut!(CUSTOM_SURFACE_SHADE_LUT).cast::<u16>();
+            let ambient = LIGHTING_AMBIENT[lighting.index()];
+            let mut level = 0;
+            while level < 256 {
+                table_pointer
+                    .add(level)
+                    .write(custom_shade_color(base, ambient, level as u8));
+                level += 1;
+            }
+            key_pointer.write(key);
+        }
+        &*core::ptr::addr_of!(CUSTOM_SURFACE_SHADE_LUT)
+    }
+}
+
+fn surface_shade_lut(options: GraphOptions) -> &'static [u16; 256] {
+    match options.surface_palette.builtin_index() {
+        Some(palette) => &SURFACE_SHADE_LUTS[options.lighting.index()][palette],
+        None => custom_surface_shade_lut(options.custom_rgb, options.lighting),
+    }
 }
 
 const fn build_shade_color_lut(base: u16, ambient: u8) -> [u16; 256] {
@@ -429,8 +500,7 @@ fn render_solid(
     // Lighting is cached at surface-sampling time. This Solid-only path avoids
     // recomputing 864 normals/square roots/divisions on camera-only redraws.
     let triangle_shades = surface.triangle_shades();
-    let shade_colors =
-        &SURFACE_SHADE_LUTS[options.lighting.index()][options.surface_palette.index()];
+    let shade_colors = surface_shade_lut(options);
     let mut projected = [[SolidVertex::INVALID; COLUMNS]; ROWS];
     let projector = camera.projector();
     let (z_min, z_max, has_height) = surface.z_range();
@@ -2559,7 +2629,7 @@ mod tests {
         let mut lighting = 0;
         while lighting < LightingPreset::COUNT {
             let mut palette = 0;
-            while palette < SurfacePalette::COUNT {
+            while palette < SurfacePalette::BUILTIN_COUNT {
                 let table = &SURFACE_SHADE_LUTS[lighting][palette];
                 assert_eq!(table[0], 0);
                 assert_eq!(table[255], SOLID_SURFACE_COLORS[palette]);
@@ -2576,6 +2646,104 @@ mod tests {
             }
             lighting += 1;
         }
+    }
+
+    #[test]
+    fn every_custom_lut_is_deterministic_bounded_and_monotonic() {
+        let colors = [
+            Rgb888 {
+                red: 0,
+                green: 0,
+                blue: 0,
+            },
+            Rgb888 {
+                red: 255,
+                green: 255,
+                blue: 255,
+            },
+            Rgb888 {
+                red: 255,
+                green: 0,
+                blue: 0,
+            },
+            Rgb888 {
+                red: 0,
+                green: 255,
+                blue: 0,
+            },
+            Rgb888 {
+                red: 0,
+                green: 0,
+                blue: 255,
+            },
+            Rgb888 {
+                red: 37,
+                green: 149,
+                blue: 211,
+            },
+        ];
+        let presets = [
+            LightingPreset::Standard,
+            LightingPreset::Soft,
+            LightingPreset::Strong,
+        ];
+        let mut preset_index = 0;
+        while preset_index < presets.len() {
+            let mut color_index = 0;
+            while color_index < colors.len() {
+                let first = build_custom_shade_lut(colors[color_index], presets[preset_index]);
+                let second = build_custom_shade_lut(colors[color_index], presets[preset_index]);
+                assert_eq!(first, second);
+                assert_eq!(first[0], 0);
+                assert_eq!(first[255], colors[color_index].to_rgb565());
+                let mut level = 2;
+                while level < first.len() {
+                    let previous = first[level - 1];
+                    let current = first[level];
+                    assert!((previous >> 11) <= (current >> 11));
+                    assert!(((previous >> 5) & 0x3f) <= ((current >> 5) & 0x3f));
+                    assert!((previous & 0x1f) <= (current & 0x1f));
+                    level += 1;
+                }
+                color_index += 1;
+            }
+            preset_index += 1;
+        }
+        assert_eq!(core::mem::size_of::<[u16; 256]>(), 512);
+    }
+
+    #[test]
+    fn custom_lut_cache_key_changes_only_with_rgb_or_lighting() {
+        let base = Rgb888::DEFAULT_CUSTOM;
+        assert_eq!(
+            custom_shade_key(base, LightingPreset::Standard),
+            custom_shade_key(base, LightingPreset::Standard)
+        );
+        assert_ne!(
+            custom_shade_key(base, LightingPreset::Standard),
+            custom_shade_key(base, LightingPreset::Soft)
+        );
+        assert_ne!(
+            custom_shade_key(base, LightingPreset::Standard),
+            custom_shade_key(
+                Rgb888 {
+                    red: base.red.saturating_add(1),
+                    ..base
+                },
+                LightingPreset::Standard
+            )
+        );
+    }
+
+    #[test]
+    fn built_in_palette_bases_remain_stable_and_complete() {
+        assert_eq!(SOLID_SURFACE_COLORS.len(), SurfacePalette::BUILTIN_COUNT);
+        assert_eq!(SOLID_SURFACE_COLORS[SurfacePalette::Blue.index()], 0x2d9f);
+        assert_eq!(SOLID_SURFACE_COLORS[SurfacePalette::Red.index()], 0xf800);
+        assert_eq!(SOLID_SURFACE_COLORS[SurfacePalette::Cyan.index()], 0x07ff);
+        assert_eq!(SOLID_SURFACE_COLORS[SurfacePalette::Yellow.index()], 0xffe0);
+        assert_eq!(SOLID_SURFACE_COLORS[SurfacePalette::White.index()], 0xffff);
+        assert_eq!(SurfacePalette::Custom.builtin_index(), None);
     }
 
     #[test]
@@ -2628,11 +2796,57 @@ mod tests {
     }
 
     #[test]
+    fn custom_palette_changes_only_color_not_triangle_depth() {
+        let vertices = [
+            solid_vertex(40, 25, 20_000),
+            solid_vertex(80, 25, 20_000),
+            solid_vertex(40, 31, 20_000),
+        ];
+        let mut first_pixels = [PALETTE.background; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut second_pixels = first_pixels;
+        let mut first_depth = [0_u16; SCREEN_WIDTH * BAND_HEIGHT];
+        let mut second_depth = first_depth;
+        let first_table = build_custom_shade_lut(
+            Rgb888 {
+                red: 20,
+                green: 80,
+                blue: 240,
+            },
+            LightingPreset::Standard,
+        );
+        let second_table = build_custom_shade_lut(
+            Rgb888 {
+                red: 240,
+                green: 80,
+                blue: 20,
+            },
+            LightingPreset::Standard,
+        );
+        draw_triangle_band(
+            &mut first_pixels,
+            &mut first_depth,
+            GRAPH_TOP,
+            vertices,
+            shaded_surface_color(180, &first_table),
+        );
+        draw_triangle_band(
+            &mut second_pixels,
+            &mut second_depth,
+            GRAPH_TOP,
+            vertices,
+            shaded_surface_color(180, &second_table),
+        );
+        assert_eq!(first_depth, second_depth);
+        assert_ne!(first_pixels, second_pixels);
+    }
+
+    #[test]
     fn graph_options_remove_coordinate_geometry_without_touching_surface() {
         let hidden = GraphOptions {
             rendering_mode: RenderingMode::Wireframe,
             lighting: LightingPreset::Standard,
             surface_palette: SurfacePalette::Blue,
+            custom_rgb: Rgb888::DEFAULT_CUSTOM,
             show_grid: false,
             show_axes: false,
             show_ticks: false,

@@ -9,6 +9,8 @@
 const PI: f32 = 3.1415927;
 const HALF_PI: f32 = 1.5707964;
 const TWO_PI: f32 = 6.2831855;
+/// Euler's number, exposed to the expression compiler as the `e` constant.
+pub const E: f32 = 2.7182817;
 
 /// Reduces a finite angle to approximately `[-pi, pi]` in bounded time.
 ///
@@ -114,6 +116,78 @@ pub fn sqrt(value: f32) -> f32 {
     estimate
 }
 
+/// Greatest integral `f32` not greater than `value`.
+///
+/// Finite `f32` values with magnitude at least `2^23` already have no
+/// fractional bits. Smaller values can be safely converted through `i32`, so
+/// this avoids a platform libm dependency while preserving floor semantics.
+pub fn floor(value: f32) -> f32 {
+    if !value.is_finite() {
+        return f32::NAN;
+    }
+    if value.abs() >= 8_388_608.0 {
+        return value;
+    }
+    let truncated = (value as i32) as f32;
+    if value < truncated {
+        truncated - 1.0
+    } else {
+        truncated
+    }
+}
+
+/// Smallest integral `f32` not less than `value`.
+pub fn ceil(value: f32) -> f32 {
+    if !value.is_finite() {
+        return f32::NAN;
+    }
+    if value.abs() >= 8_388_608.0 {
+        return value;
+    }
+    let truncated = (value as i32) as f32;
+    if value > truncated {
+        truncated + 1.0
+    } else {
+        truncated
+    }
+}
+
+/// Rounds to the nearest integral value, with half values away from zero.
+pub fn round(value: f32) -> f32 {
+    if !value.is_finite() || value.abs() >= 8_388_608.0 {
+        return value;
+    }
+    if value >= 0.0 {
+        floor(value + 0.5)
+    } else {
+        ceil(value - 0.5)
+    }
+}
+
+/// Finite numerical minimum. Any non-finite operand deliberately invalidates
+/// the complete expression rather than selecting the other operand.
+pub fn min(left: f32, right: f32) -> f32 {
+    if !left.is_finite() || !right.is_finite() {
+        f32::NAN
+    } else if left <= right {
+        left
+    } else {
+        right
+    }
+}
+
+/// Finite numerical maximum. Any non-finite operand deliberately invalidates
+/// the complete expression rather than selecting the other operand.
+pub fn max(left: f32, right: f32) -> f32 {
+    if !left.is_finite() || !right.is_finite() {
+        f32::NAN
+    } else if left >= right {
+        left
+    } else {
+        right
+    }
+}
+
 /// Real `f32` power. Integer exponents support negative bases; fractional
 /// exponents use the local `exp(exponent * ln(base))` approximation.
 pub fn pow(base: f32, exponent: f32) -> f32 {
@@ -149,7 +223,9 @@ fn integer_power(mut base: f32, mut exponent: u32) -> f32 {
     result
 }
 
-fn ln(mut value: f32) -> f32 {
+/// Natural logarithm approximation. Non-positive or non-finite inputs return
+/// NaN so the evaluator can reject them uniformly.
+pub fn ln(mut value: f32) -> f32 {
     const LN_2: f32 = 0.6931472;
     if value <= 0.0 || !value.is_finite() {
         return f32::NAN;
@@ -180,7 +256,9 @@ fn ln(mut value: f32) -> f32 {
     2.0 * sum + exponent as f32 * LN_2
 }
 
-fn exp(value: f32) -> f32 {
+/// Exponential approximation. Overflow is represented as infinity and is
+/// rejected by the expression evaluator before it reaches graphing code.
+pub fn exp(value: f32) -> f32 {
     const LN_2: f32 = 0.6931472;
     if value > 88.0 {
         return f32::INFINITY;
@@ -209,9 +287,149 @@ fn exp(value: f32) -> f32 {
     }
 }
 
+/// Explicit-base logarithm with the mathematical domain `base > 0`,
+/// `base != 1`, and `value > 0`.
+pub fn log(base: f32, value: f32) -> f32 {
+    if !base.is_finite() || !value.is_finite() || base <= 0.0 || base == 1.0 || value <= 0.0 {
+        return f32::NAN;
+    }
+    ln(value) / ln(base)
+}
+
+/// Arctangent approximation with reciprocal range reduction.
+///
+/// The polynomial is evaluated only on `[0, 1]`, where it remains well within
+/// the expression engine's graphing tolerance. Large finite arguments are
+/// reduced by one reciprocal, not an unbounded loop.
+pub fn atan(value: f32) -> f32 {
+    if !value.is_finite() {
+        return f32::NAN;
+    }
+    let negative = value < 0.0;
+    let magnitude = value.abs();
+    let reciprocal = magnitude > 1.0;
+    let reduced = if reciprocal {
+        1.0 / magnitude
+    } else {
+        magnitude
+    };
+    let squared = reduced * reduced;
+    let polynomial = reduced
+        * (0.999866
+            + squared
+                * (-0.3302995 + squared * (0.180141 + squared * (-0.085133 + squared * 0.020835))));
+    let angle = if reciprocal {
+        HALF_PI - polynomial
+    } else {
+        polynomial
+    };
+    if negative {
+        -angle
+    } else {
+        angle
+    }
+}
+
+/// Arcsine derived from the local square root and arctangent approximations.
+pub fn asin(value: f32) -> f32 {
+    if !value.is_finite() || value < -1.0 || value > 1.0 {
+        return f32::NAN;
+    }
+    if value == 1.0 {
+        return HALF_PI;
+    }
+    if value == -1.0 {
+        return -HALF_PI;
+    }
+    atan(value / sqrt((1.0 - value) * (1.0 + value)))
+}
+
+/// Arccosine derived from the local arcsine approximation.
+pub fn acos(value: f32) -> f32 {
+    if !value.is_finite() || value < -1.0 || value > 1.0 {
+        return f32::NAN;
+    }
+    HALF_PI - asin(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn close(actual: f32, expected: f32, tolerance: f32) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{} != {} within {}",
+            actual,
+            expected,
+            tolerance
+        );
+    }
+
+    #[test]
+    fn integral_and_extrema_functions_follow_finite_math_semantics() {
+        assert_eq!(floor(3.7), 3.0);
+        assert_eq!(floor(-3.7), -4.0);
+        assert_eq!(ceil(3.2), 4.0);
+        assert_eq!(ceil(-3.2), -3.0);
+        assert_eq!(round(2.5), 3.0);
+        assert_eq!(round(-2.5), -3.0);
+        assert_eq!(min(2.0, 5.0), 2.0);
+        assert_eq!(min(-2.0, -5.0), -5.0);
+        assert_eq!(min(4.0, 4.0), 4.0);
+        assert_eq!(max(2.0, 5.0), 5.0);
+        assert_eq!(max(-2.0, -5.0), -2.0);
+        assert_eq!(max(4.0, 4.0), 4.0);
+        assert!(min(1.0, f32::NAN).is_nan());
+        assert!(max(f32::INFINITY, 1.0).is_nan());
+    }
+
+    #[test]
+    fn exponential_and_logarithmic_domains_are_bounded() {
+        close(exp(0.0), 1.0, 0.001);
+        close(ln(1.0), 0.0, 0.001);
+        close(log(10.0, 100.0), 2.0, 0.002);
+        close(log(2.0, 8.0), 3.0, 0.002);
+        close(log(E, E), 1.0, 0.002);
+        assert!(ln(0.0).is_nan());
+        assert!(ln(-1.0).is_nan());
+        assert!(log(1.0, 10.0).is_nan());
+        assert!(log(10.0, 0.0).is_nan());
+        assert!(log(-2.0, 10.0).is_nan());
+    }
+
+    #[test]
+    fn inverse_trigonometric_approximations_match_host_references() {
+        let inverse_sine_points = [-1.0, -0.9999, -0.9, -0.5, 0.0, 0.5, 0.9, 0.9999, 1.0];
+        let inverse_tangent_points = [-100.0, -10.0, -1.0, -0.5, 0.0, 0.5, 1.0, 10.0, 100.0];
+        let mut asin_error = 0.0_f32;
+        let mut acos_error = 0.0_f32;
+        let mut atan_error = 0.0_f32;
+
+        for point in inverse_sine_points {
+            asin_error = asin_error.max((asin(point) - point.asin()).abs());
+            acos_error = acos_error.max((acos(point) - point.acos()).abs());
+        }
+        for point in inverse_tangent_points {
+            atan_error = atan_error.max((atan(point) - point.atan()).abs());
+        }
+
+        println!(
+            "inverse-trig max absolute error: asin={}, acos={}, atan={}",
+            asin_error, acos_error, atan_error
+        );
+        assert!(asin_error <= 0.005, "asin maximum error: {}", asin_error);
+        assert!(acos_error <= 0.005, "acos maximum error: {}", acos_error);
+        assert!(atan_error <= 0.005, "atan maximum error: {}", atan_error);
+    }
+
+    #[test]
+    fn inverse_trigonometric_domains_return_nan() {
+        for value in [-1.1, 1.1] {
+            assert!(asin(value).is_nan());
+            assert!(acos(value).is_nan());
+        }
+    }
 
     #[test]
     fn bounded_angle_reduction_handles_large_finite_inputs() {

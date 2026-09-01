@@ -35,11 +35,7 @@ enum Instruction {
     Divide,
     Power,
     Negate,
-    Sin,
-    Cos,
-    Tan,
-    Sqrt,
-    Abs,
+    Function(Function),
     End,
 }
 
@@ -52,11 +48,37 @@ enum Operator {
     Divide,
     Power,
     Negate,
+    Function(Function),
+}
+
+/// Fixed-arity functions understood by the compact postfix evaluator.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Function {
     Sin,
     Cos,
     Tan,
     Sqrt,
     Abs,
+    Floor,
+    Ceil,
+    Round,
+    Exp,
+    Ln,
+    Asin,
+    Acos,
+    Atan,
+    Min,
+    Max,
+    Log,
+}
+
+impl Function {
+    fn arity(self) -> u8 {
+        match self {
+            Function::Min | Function::Max | Function::Log => 2,
+            _ => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -71,6 +93,8 @@ pub enum ParseError {
     MissingOperator,
     MissingOpeningParenthesis,
     MissingClosingParenthesis,
+    InvalidArgumentSeparator,
+    InvalidArgumentCount,
     OperatorStackOverflow,
     BytecodeTooLarge,
     EvaluationStackOverflow,
@@ -122,11 +146,9 @@ impl CompiledExpression {
                 Instruction::X => push(&mut stack, &mut depth, x)?,
                 Instruction::Y => push(&mut stack, &mut depth, y)?,
                 Instruction::Negate => apply_unary(&mut stack, depth, |value| -value)?,
-                Instruction::Sin => apply_unary(&mut stack, depth, |value| math::sin_cos(value).0)?,
-                Instruction::Cos => apply_unary(&mut stack, depth, |value| math::sin_cos(value).1)?,
-                Instruction::Tan => apply_unary(&mut stack, depth, math::tan)?,
-                Instruction::Sqrt => apply_unary(&mut stack, depth, math::sqrt)?,
-                Instruction::Abs => apply_unary(&mut stack, depth, |value| value.abs())?,
+                Instruction::Function(function) => {
+                    apply_function(&mut stack, &mut depth, function)?
+                }
                 Instruction::Add => apply_binary(&mut stack, &mut depth, |a, b| a + b)?,
                 Instruction::Subtract => apply_binary(&mut stack, &mut depth, |a, b| a - b)?,
                 Instruction::Multiply => apply_binary(&mut stack, &mut depth, |a, b| a * b)?,
@@ -162,6 +184,9 @@ struct Parser<'a> {
     code: [Instruction; MAX_BYTECODE_LENGTH],
     code_length: usize,
     operators: [Operator; MAX_OPERATOR_DEPTH],
+    /// Argument counts live beside the opening-parenthesis operator they
+    /// describe. This makes nested comma-separated calls fixed-capacity.
+    argument_counts: [u8; MAX_OPERATOR_DEPTH],
     operator_length: usize,
     expects_operand: bool,
     saw_value: bool,
@@ -175,6 +200,7 @@ impl<'a> Parser<'a> {
             code: [Instruction::End; MAX_BYTECODE_LENGTH],
             code_length: 0,
             operators: [Operator::LeftParenthesis; MAX_OPERATOR_DEPTH],
+            argument_counts: [0; MAX_OPERATOR_DEPTH],
             operator_length: 0,
             expects_operand: true,
             saw_value: false,
@@ -300,17 +326,44 @@ impl<'a> Parser<'a> {
             self.accept_value();
             return Ok(());
         }
+        if name == b"e" {
+            self.emit(Instruction::Constant(math::E))?;
+            self.accept_value();
+            return Ok(());
+        }
 
         let function = if name == b"sin" {
-            Operator::Sin
+            Function::Sin
         } else if name == b"cos" {
-            Operator::Cos
+            Function::Cos
         } else if name == b"tan" {
-            Operator::Tan
+            Function::Tan
         } else if name == b"sqrt" {
-            Operator::Sqrt
+            Function::Sqrt
         } else if name == b"abs" {
-            Operator::Abs
+            Function::Abs
+        } else if name == b"floor" {
+            Function::Floor
+        } else if name == b"ceil" {
+            Function::Ceil
+        } else if name == b"round" {
+            Function::Round
+        } else if name == b"exp" {
+            Function::Exp
+        } else if name == b"ln" {
+            Function::Ln
+        } else if name == b"asin" {
+            Function::Asin
+        } else if name == b"acos" {
+            Function::Acos
+        } else if name == b"atan" {
+            Function::Atan
+        } else if name == b"min" {
+            Function::Min
+        } else if name == b"max" {
+            Function::Max
+        } else if name == b"log" {
+            Function::Log
         } else {
             return Err(ParseError::UnknownFunction);
         };
@@ -319,8 +372,8 @@ impl<'a> Parser<'a> {
         if self.position >= self.source.len() || self.source[self.position] != b'(' {
             return Err(ParseError::MissingOpeningParenthesis);
         }
-        self.push_operator(function)?;
-        self.push_operator(Operator::LeftParenthesis)?;
+        self.push_operator(Operator::Function(function))?;
+        self.push_function_parenthesis()?;
         self.position += 1;
         Ok(())
     }
@@ -335,6 +388,7 @@ impl<'a> Parser<'a> {
                 self.push_operator(Operator::LeftParenthesis)
             }
             b')' => self.close_parenthesis(),
+            b',' => self.accept_separator(),
             b'-' if self.expects_operand => self.push_operator(Operator::Negate),
             b'+' if self.expects_operand => Err(ParseError::MissingOperand),
             b'+' => self.accept_binary(Operator::Add),
@@ -350,26 +404,76 @@ impl<'a> Parser<'a> {
         if self.expects_operand {
             return Err(ParseError::MissingOperand);
         }
-        let mut found = false;
+        let mut left_index = None;
         while self.operator_length > 0 {
             let operator = self.pop_operator();
             if matches!(operator, Operator::LeftParenthesis) {
-                found = true;
+                left_index = Some(self.operator_length);
                 break;
             }
             self.emit_operator(operator)?;
         }
-        if !found {
-            return Err(ParseError::MissingOpeningParenthesis);
-        }
+        let left_index = match left_index {
+            Some(index) => index,
+            None => return Err(ParseError::MissingOpeningParenthesis),
+        };
+        let separator_count = self.argument_counts[left_index];
         if self.operator_length > 0 {
             let operator = self.operators[self.operator_length - 1];
-            if is_function(operator) {
+            if let Operator::Function(function) = operator {
                 self.operator_length -= 1;
+                if separator_count.saturating_add(1) != function.arity() {
+                    return Err(ParseError::InvalidArgumentCount);
+                }
                 self.emit_operator(operator)?;
+            } else if separator_count != 0 {
+                return Err(ParseError::InvalidArgumentSeparator);
             }
+        } else if separator_count != 0 {
+            return Err(ParseError::InvalidArgumentSeparator);
         }
         self.expects_operand = false;
+        Ok(())
+    }
+
+    /// A separator closes the preceding argument within the innermost function
+    /// call. It cannot escape into an outer call or an ordinary parenthesis.
+    fn accept_separator(&mut self) -> Result<(), ParseError> {
+        if self.expects_operand {
+            return Err(ParseError::MissingOperand);
+        }
+        let mut left_index = None;
+        let mut index = self.operator_length;
+        while index > 0 {
+            index -= 1;
+            if matches!(self.operators[index], Operator::LeftParenthesis) {
+                left_index = Some(index);
+                break;
+            }
+        }
+        let left_index = match left_index {
+            Some(index) => index,
+            None => return Err(ParseError::InvalidArgumentSeparator),
+        };
+        if left_index == 0 || !is_function(self.operators[left_index - 1]) {
+            return Err(ParseError::InvalidArgumentSeparator);
+        }
+        while self.operator_length > left_index + 1 {
+            let operator = self.pop_operator();
+            self.emit_operator(operator)?;
+        }
+        self.argument_counts[left_index] = self.argument_counts[left_index].saturating_add(1);
+        self.expects_operand = true;
+        Ok(())
+    }
+
+    fn push_function_parenthesis(&mut self) -> Result<(), ParseError> {
+        if self.operator_length >= MAX_OPERATOR_DEPTH {
+            return Err(ParseError::OperatorStackOverflow);
+        }
+        self.operators[self.operator_length] = Operator::LeftParenthesis;
+        self.argument_counts[self.operator_length] = 0;
+        self.operator_length += 1;
         Ok(())
     }
 
@@ -410,11 +514,7 @@ impl<'a> Parser<'a> {
             Operator::Divide => Instruction::Divide,
             Operator::Power => Instruction::Power,
             Operator::Negate => Instruction::Negate,
-            Operator::Sin => Instruction::Sin,
-            Operator::Cos => Instruction::Cos,
-            Operator::Tan => Instruction::Tan,
-            Operator::Sqrt => Instruction::Sqrt,
-            Operator::Abs => Instruction::Abs,
+            Operator::Function(function) => Instruction::Function(function),
             Operator::LeftParenthesis => return Err(ParseError::MissingClosingParenthesis),
         };
         self.emit(instruction)
@@ -434,6 +534,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError::OperatorStackOverflow);
         }
         self.operators[self.operator_length] = operator;
+        self.argument_counts[self.operator_length] = 0;
         self.operator_length += 1;
         Ok(())
     }
@@ -466,10 +567,7 @@ fn is_right_associative(operator: Operator) -> bool {
 }
 
 fn is_function(operator: Operator) -> bool {
-    matches!(
-        operator,
-        Operator::Sin | Operator::Cos | Operator::Tan | Operator::Sqrt | Operator::Abs
-    )
+    matches!(operator, Operator::Function(_))
 }
 
 fn validate_bytecode(
@@ -481,15 +579,21 @@ fn validate_bytecode(
     while position < length {
         match code[position] {
             Instruction::Constant(_) | Instruction::X | Instruction::Y => depth += 1,
-            Instruction::Negate
-            | Instruction::Sin
-            | Instruction::Cos
-            | Instruction::Tan
-            | Instruction::Sqrt
-            | Instruction::Abs => {
+            Instruction::Negate => {
                 if depth < 1 {
                     return Err(ParseError::MissingOperand);
                 }
+            }
+            Instruction::Function(function) if function.arity() == 1 => {
+                if depth < 1 {
+                    return Err(ParseError::MissingOperand);
+                }
+            }
+            Instruction::Function(function) if function.arity() == 2 => {
+                if depth < 2 {
+                    return Err(ParseError::MissingOperand);
+                }
+                depth -= 1;
             }
             Instruction::Add
             | Instruction::Subtract
@@ -502,6 +606,7 @@ fn validate_bytecode(
                 depth -= 1;
             }
             Instruction::End => return Err(ParseError::MissingOperand),
+            _ => return Err(ParseError::MissingOperand),
         }
         if depth > MAX_EVALUATION_DEPTH {
             return Err(ParseError::EvaluationStackOverflow);
@@ -529,6 +634,33 @@ fn push(
     stack[*depth] = value;
     *depth += 1;
     Ok(())
+}
+
+/// Dispatches a fixed-arity mathematical function without allocating or
+/// introducing evaluator recursion.
+fn apply_function(
+    stack: &mut [f32; MAX_EVALUATION_DEPTH],
+    depth: &mut usize,
+    function: Function,
+) -> Result<(), EvaluationError> {
+    match function {
+        Function::Sin => apply_unary(stack, *depth, |value| math::sin_cos(value).0),
+        Function::Cos => apply_unary(stack, *depth, |value| math::sin_cos(value).1),
+        Function::Tan => apply_unary(stack, *depth, math::tan),
+        Function::Sqrt => apply_unary(stack, *depth, math::sqrt),
+        Function::Abs => apply_unary(stack, *depth, |value| value.abs()),
+        Function::Floor => apply_unary(stack, *depth, math::floor),
+        Function::Ceil => apply_unary(stack, *depth, math::ceil),
+        Function::Round => apply_unary(stack, *depth, math::round),
+        Function::Exp => apply_unary(stack, *depth, math::exp),
+        Function::Ln => apply_unary(stack, *depth, math::ln),
+        Function::Asin => apply_unary(stack, *depth, math::asin),
+        Function::Acos => apply_unary(stack, *depth, math::acos),
+        Function::Atan => apply_unary(stack, *depth, math::atan),
+        Function::Min => apply_binary(stack, depth, math::min),
+        Function::Max => apply_binary(stack, depth, math::max),
+        Function::Log => apply_binary(stack, depth, math::log),
+    }
 }
 
 fn apply_unary<F>(
@@ -638,6 +770,50 @@ mod tests {
     }
 
     #[test]
+    fn expanded_unary_functions_and_e_constant_evaluate() {
+        close(value("abs(-5)", 0.0, 0.0), 5.0);
+        close(value("floor(3.7)", 0.0, 0.0), 3.0);
+        close(value("floor(-3.7)", 0.0, 0.0), -4.0);
+        close(value("ceil(3.2)", 0.0, 0.0), 4.0);
+        close(value("ceil(-3.2)", 0.0, 0.0), -3.0);
+        close(value("round(2.5)", 0.0, 0.0), 3.0);
+        close(value("round(-2.5)", 0.0, 0.0), -3.0);
+        close(value("exp(0)", 0.0, 0.0), 1.0);
+        close(value("ln(1)", 0.0, 0.0), 0.0);
+        close(value("e", 0.0, 0.0), math::E);
+        close(value("2*e", 0.0, 0.0), 2.0 * math::E);
+        close(value("e^2", 0.0, 0.0), math::E * math::E);
+        close(value("1e3", 0.0, 0.0), 1000.0);
+        close(value("2.5e-4", 0.0, 0.0), 0.00025);
+    }
+
+    #[test]
+    fn binary_functions_and_nested_arguments_evaluate() {
+        close(value("min(2,5)", 0.0, 0.0), 2.0);
+        close(value("min(5,2)", 0.0, 0.0), 2.0);
+        close(value("min(-2,-5)", 0.0, 0.0), -5.0);
+        close(value("min(4,4)", 0.0, 0.0), 4.0);
+        close(value("max(2,5)", 0.0, 0.0), 5.0);
+        close(value("max(5,2)", 0.0, 0.0), 5.0);
+        close(value("max(-2,-5)", 0.0, 0.0), -2.0);
+        close(value("max(4,4)", 0.0, 0.0), 4.0);
+        close(value("log(10,100)", 0.0, 0.0), 2.0);
+        close(value("log(2,8)", 0.0, 0.0), 3.0);
+        close(value("log(10,1000)", 0.0, 0.0), 3.0);
+        close(value("log(e,e)", 0.0, 0.0), 1.0);
+        close(value("log(2,min(8,16))", 0.0, 0.0), 3.0);
+        close(value("min(1,max(2,3))", 0.0, 0.0), 1.0);
+        close(value("log(2,log(2,16))", 0.0, 0.0), 2.0);
+    }
+
+    #[test]
+    fn inverse_trigonometric_functions_evaluate() {
+        close(value("asin(0.5)", 0.0, 0.0), math::asin(0.5));
+        close(value("acos(0.5)", 0.0, 0.0), math::acos(0.5));
+        close(value("atan(1)", 0.0, 0.0), math::atan(1.0));
+    }
+
+    #[test]
     fn malformed_expressions_are_rejected() {
         assert!(matches!(
             CompiledExpression::compile(""),
@@ -652,6 +828,39 @@ mod tests {
     }
 
     #[test]
+    fn invalid_function_arity_and_separators_are_rejected() {
+        let invalid = [
+            "log()",
+            "log(2)",
+            "log(2,8,16)",
+            "log(,8)",
+            "log(2,)",
+            "min(,)",
+            "sin(1,2)",
+            "sin(,)",
+            ",",
+            "(1,2)",
+            "max()",
+            "max(1)",
+            "abs()",
+            "abs(1,2)",
+            "ln()",
+            "ln(1,2)",
+        ];
+        for source in invalid {
+            assert!(CompiledExpression::compile(source).is_err(), "{}", source);
+        }
+        assert!(matches!(
+            CompiledExpression::compile("log(2)"),
+            Err(ParseError::InvalidArgumentCount)
+        ));
+        assert!(matches!(
+            CompiledExpression::compile("(1,2)"),
+            Err(ParseError::InvalidArgumentSeparator)
+        ));
+    }
+
+    #[test]
     fn invalid_math_is_reported() {
         let division = CompiledExpression::compile("1 / 0").expect("valid expression");
         assert_eq!(
@@ -663,6 +872,27 @@ mod tests {
             square_root.evaluate_checked(0.0, 0.0),
             Err(EvaluationError::NonFiniteResult)
         );
+        for source in [
+            "ln(0)",
+            "ln(-1)",
+            "log(1,10)",
+            "log(10,0)",
+            "log(-2,10)",
+            "asin(1.1)",
+            "asin(-1.1)",
+            "acos(1.1)",
+            "acos(-1.1)",
+            "min(1,ln(-1))",
+            "max(1,1/0)",
+        ] {
+            let expression = CompiledExpression::compile(source).expect("valid syntax");
+            assert_eq!(
+                expression.evaluate_checked(0.0, 0.0),
+                Err(EvaluationError::NonFiniteResult),
+                "{}",
+                source
+            );
+        }
     }
 
     #[test]

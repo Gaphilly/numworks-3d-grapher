@@ -7,7 +7,7 @@
 //! to preserve composition order and avoid stale/flashing text.
 
 use crate::eadk::{self, Color, Point, Rect};
-use crate::editor::{EquationEditor, VISIBLE_CHARACTERS};
+use crate::editor::{EquationEditor, FunctionTemplate, FUNCTION_PICKER_ROWS, VISIBLE_CHARACTERS};
 use crate::expression::ParseError;
 use crate::graph::{GraphOptions, LightingPreset, RenderingMode, SurfacePalette};
 use crate::settings::{
@@ -38,7 +38,7 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.4.0\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.5.0\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
@@ -182,6 +182,11 @@ pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
         );
     }
 
+    if editor.function_picker_open() {
+        draw_function_picker(editor, focused);
+        return;
+    }
+
     if let Some(error) = editor.error() {
         eadk::display::draw_string(
             error_message(error),
@@ -207,8 +212,68 @@ pub fn draw_equation_editor(editor: &EquationEditor, focused: bool) {
         WHITE,
     );
     eadk::display::draw_string(
-        b"Toolbox: abs()\0",
+        b"Toolbox: functions\0",
         Point { x: 12, y: 169 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+}
+
+/// Draws the bounded two-column Equation Toolbox picker. It is part of the
+/// normal Equation content redraw and never owns a blocking event loop.
+fn draw_function_picker(editor: &EquationEditor, focused: bool) {
+    eadk::display::draw_string(
+        b"Functions\0",
+        Point { x: 12, y: 118 },
+        false,
+        DARK_GRAY,
+        WHITE,
+    );
+    let mut column = 0_u8;
+    while column < 2 {
+        let mut row = 0_u8;
+        while row < FUNCTION_PICKER_ROWS as u8 {
+            let selected =
+                editor.function_picker_column() == column && editor.function_picker_row() == row;
+            let x = 12 + column as u16 * 150;
+            let y = 132 + row as u16 * 12;
+            let background = if selected { FIELD_BACKGROUND } else { WHITE };
+            eadk::display::push_rect_uniform(
+                Rect {
+                    x,
+                    y: y - 1,
+                    width: 136,
+                    height: 11,
+                },
+                background,
+            );
+            if selected {
+                eadk::display::push_rect_uniform(
+                    Rect {
+                        x,
+                        y: y - 1,
+                        width: 3,
+                        height: 11,
+                    },
+                    if focused { ORANGE } else { DARK_GRAY },
+                );
+            }
+            let template = FunctionTemplate::from_position(column, row);
+            eadk::display::draw_string(
+                template.label(),
+                Point { x: x + 7, y },
+                false,
+                BLACK,
+                background,
+            );
+            row += 1;
+        }
+        column += 1;
+    }
+    eadk::display::draw_string(
+        b"Arrows: select  EXE: insert\0",
+        Point { x: 12, y: 228 },
         false,
         DARK_GRAY,
         WHITE,
@@ -856,6 +921,9 @@ fn error_message(error: ParseError) -> &'static [u8] {
         | ParseError::EvaluationStackOverflow => b"Expression too complex\0",
         ParseError::EmptyExpression => b"Enter an expression\0",
         ParseError::InvalidNumber => b"Invalid number\0",
+        ParseError::InvalidArgumentSeparator | ParseError::InvalidArgumentCount => {
+            b"Invalid arguments\0"
+        }
         ParseError::MissingOperand | ParseError::MissingOperator => b"Invalid expression\0",
     }
 }
@@ -866,7 +934,7 @@ mod tests {
 
     #[test]
     fn displayed_release_version_remains_manually_fixed() {
-        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.4.0\0");
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.5.0\0");
     }
 
     #[test]

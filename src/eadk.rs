@@ -177,6 +177,8 @@ pub mod event {
     // Values mirror the installed EADK header. Letter ranges contain deliberate
     // gaps, hence `lowercase_letter` uses explicit matching rather than arithmetic.
     pub const LEFT: Event = 0;
+    pub const UP: Event = 1;
+    pub const DOWN: Event = 2;
     pub const RIGHT: Event = 3;
     pub const OK: Event = 4;
     pub const BACK: Event = 5;

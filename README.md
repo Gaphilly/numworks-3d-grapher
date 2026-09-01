@@ -12,7 +12,7 @@ The project targets `thumbv7em-none-eabihf` (the calculator's Cortex-M7-class Th
 - Ten Solid color choices: Blue, Green, Orange, Purple, Gray, Red, Cyan, Yellow, White, and a user-editable Custom RGB color
 - Band-local depth testing for filled triangles
 - Configurable ground grid, axes, ticks, coordinate labels, rectangular XY domain, and camera reset
-- `f32` expression compiler/evaluator supporting constants, `x`, `y`, arithmetic, power, parentheses, unary minus, and `sin`, `cos`, `tan`, `sqrt`, and `abs`
+- `f32` expression compiler/evaluator with fixed-arity unary/binary functions, explicit-base logarithms, and safe invalid-domain rejection
 - Calculator-style Equation editor with a 96-byte buffer, cursor, scrolling, shortcuts, errors, and held-key repeat
 - Transactional 24-byte numeric editor for each domain bound
 - Graph, Equation, and Settings tabs with explicit focus and separate graph/surface dirty state
@@ -64,7 +64,7 @@ Camera keys use raw keyboard state and repeat smoothly while held. Distance, pit
 | XNT | Insert `x` |
 | Alpha letters | Insert lowercase letters, including `y` |
 | sin, cos, tan, sqrt | Insert a complete function template with the cursor inside `()` |
-| Toolbox | Insert `abs()` with the cursor inside |
+| Toolbox | Open the two-column function-template picker |
 | Square / Power | Insert `^2` / `^` |
 | Left / Right | Move cursor; hold to repeat |
 | Shift + Left / Right | Move to start / end |
@@ -73,6 +73,8 @@ Camera keys use raw keyboard state and repeat smoothly while held. Distance, pit
 | EXE | Compile; on success update the surface and return to Graph |
 | OK | Give focus to the tab bar |
 | Back | Return to Graph without applying edited text |
+
+Toolbox contains `sin`, `cos`, `tan`, `sqrt`, `abs`, `floor`, `ceil`, `round`, `exp`, `ln`, `log`, `min`, `max`, `asin`, `acos`, and `atan`. Up/Down wraps within a column, Left/Right changes columns, EXE inserts the selected template, and Back closes the picker without editing. Unary templates put the cursor inside `()`, while `log(,)`, `min(,)`, and `max(,)` place it after the opening parenthesis.
 
 The edited source and last successfully compiled expression are separate. An invalid edit displays an error but never replaces the active graph.
 
@@ -108,13 +110,16 @@ Applying a bound is transactional: an invalid draft never changes or resamples t
 
 Expressions are ASCII and may contain:
 
-- Decimal or scientific-notation `f32` constants, such as `2`, `.5`, and `1e-3`
+- Decimal or scientific-notation `f32` constants, such as `2`, `.5`, and `1e-3`, plus Euler's constant `e`
 - Variables `x` and `y`
 - Binary operators `+`, `-`, `*`, `/`, and `^`
 - Unary minus, parentheses, and whitespace
-- Functions `sin(...)`, `cos(...)`, `tan(...)`, `sqrt(...)`, and `abs(...)`
+- Unary functions `sin(...)`, `cos(...)`, `tan(...)`, `sqrt(...)`, `abs(...)`, `floor(...)`, `ceil(...)`, `round(...)`, `exp(...)`, `ln(...)`, `asin(...)`, `acos(...)`, and `atan(...)`
+- Binary functions `min(a, b)`, `max(a, b)`, and explicit-base `log(base, value)`
 
-Power and unary negation are right-associative with power binding more tightly: `-2^2` is interpreted as `-(2^2)`, and `2^3^2` as `2^(3^2)`. Function names and variables are lowercase, and multiplication must be explicit. Non-finite evaluation results become invalid samples rather than entering projection or rasterization.
+Power and unary negation are right-associative with power binding more tightly: `-2^2` is interpreted as `-(2^2)`, and `2^3^2` as `2^(3^2)`. Function names and variables are lowercase, multiplication must be explicit, and binary-function arguments are comma-separated. `log(base, value)` requires `base > 0`, `base != 1`, and `value > 0`; inverse sine/cosine require an input in `[-1, 1]`. `min` and `max` reject a non-finite operand rather than selecting the other argument. All non-finite evaluation results become invalid samples rather than entering projection or rasterization.
+
+Useful default-domain examples include `abs(x) + abs(y)`, `log(10, x^2 + y^2 + 1)`, `ln(x^2 + y^2 + 1)`, `exp(-(x^2 + y^2))`, `max(x, y)`, `min(x, y)`, and `sin(sqrt(x^2 + y^2))`.
 
 ## Architecture
 
@@ -244,7 +249,7 @@ If a technically correct feature makes the calculator noticeably less responsive
 | `src/main.rs` | NWA metadata, exported entry point, cooperative input/render loop, surface-cache ownership, render timing, and optional freeze diagnostics |
 | `src/app.rs` | Tab/content focus state machine, graph options, domain state, and header/content/graph/surface dirty flags |
 | `src/eadk.rs` | Rust FFI layout, constants, and guarded wrappers for firmware display, keyboard, event, and timing symbols |
-| `src/editor.rs` | Fixed 96-byte Equation editor, cursor/scroll logic, calculator event mapping, and held-key repeat |
+| `src/editor.rs` | Fixed 96-byte Equation editor, cursor/scroll logic, bounded Toolbox function picker, calculator event mapping, and held-key repeat |
 | `src/settings.rs` | Eight-row Settings interaction, Appearance/transactional Custom RGB pages, optional performance readout, and shared fixed 24-byte numeric editor |
 | `src/expression.rs` | Streaming tokenizer, shunting-yard parser, fixed postfix bytecode, and stack evaluator |
 | `src/function.rs` | `SurfaceFunction` boundary between evaluation and sampling |
@@ -254,7 +259,7 @@ If a technically correct feature makes the calculator noticeably less responsive
 | `src/rendering.rs` | Wireframe/solid projected caches, coordinate/label geometry, band rasterization, inverse-depth testing, and EADK transfers |
 | `src/input.rs` | Smooth raw-key graph camera mapping |
 | `src/ui.rs` | Tab header, Equation UI, Settings/Appearance/domain UI, version display, and user-facing errors |
-| `src/math.rs` | Small `no_std` `f32` trigonometric, root, and power approximations |
+| `src/math.rs` | Small `no_std` `f32` trigonometric, inverse-trigonometric, logarithmic, root, rounding, and power approximations |
 | `src/icon.png` | Application icon source converted to NWI during embedded builds |
 | `build.rs` | Host-side timestamped PNG-to-NWI conversion through nwlink |
 | `.cargo/config.toml` | Default ARM target, relocatable linker settings, and pinned install runner |
@@ -308,7 +313,15 @@ The final command requires a connected calculator and begins the mandatory physi
 
 ## Version policy
 
-Settings displays the manually maintained version string **`v2.4.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+Settings displays the manually maintained version string **`v2.5.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+
+## v2.5.0 changes
+
+- Adds `e`, `floor`, `ceil`, `round`, `exp`, `ln`, `min`, `max`, explicit-base `log(base, value)`, `asin`, `acos`, and `atan` to the fixed-capacity evaluator.
+- Adds fixed-arity comma parsing with safe nested calls and structured invalid-argument errors.
+- Replaces the direct Toolbox `abs()` shortcut with a compact two-column function-template picker.
+- Preserves the released Wireframe and Solid render paths, surface layout, display-transfer strategy, and color/depth architecture.
+- Sets the manually maintained displayed/package version to 2.5.0 for this release.
 
 ## v2.4.0 changes
 

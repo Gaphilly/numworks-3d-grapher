@@ -768,6 +768,29 @@ mod tests {
     }
 
     #[test]
+    fn new_function_domain_failures_remain_invalid_surface_samples() {
+        for source in ["ln(x)", "log(10,x)", "log(1,x)", "asin(x)", "acos(x)"] {
+            let expression = CompiledExpression::compile(source).expect("valid expression");
+            let grid = SurfaceGrid::sample(Domain::DEFAULT, &expression);
+            let mut saw_invalid_height = false;
+            let mut row = 0;
+            while row < ROWS {
+                let mut column = 0;
+                while column < COLUMNS {
+                    if !grid.solid_point(column, row).z.is_finite() {
+                        saw_invalid_height = true;
+                    }
+                    column += 1;
+                }
+                row += 1;
+            }
+            let (_, invalid) = shade_counts(&grid.triangle_shades());
+            assert!(saw_invalid_height, "{}", source);
+            assert!(invalid > 0, "{}", source);
+        }
+    }
+
+    #[test]
     fn domain_validation_rejects_unsafe_bounds() {
         assert_eq!(Domain::DEFAULT.validate(), Ok(()));
         assert_eq!(

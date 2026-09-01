@@ -262,6 +262,9 @@ impl AppState {
             if self.active_tab == Tab::Settings && self.settings.is_editing() {
                 let _ = self.settings.back();
             }
+            if self.active_tab == Tab::Equation {
+                let _ = self.editor.close_function_picker();
+            }
             self.selected_tab = self.active_tab;
             self.focus = Focus::Tabs;
             self.dirty.header = true;
@@ -308,6 +311,10 @@ impl AppState {
         if self.active_tab == Tab::Settings {
             let action = self.settings.back();
             return self.apply_settings_action(action);
+        }
+        if self.active_tab == Tab::Equation && self.editor.close_function_picker() {
+            self.dirty.content = true;
+            return UpdateResult::StateChanged;
         }
         if self.active_tab != Tab::Graph {
             self.active_tab = Tab::Graph;
@@ -475,6 +482,35 @@ mod tests {
         ));
         assert_eq!(app.active_tab, Tab::Graph);
         assert_eq!(active.evaluate(2.0, 3.0), before);
+    }
+
+    #[test]
+    fn equation_picker_back_and_ok_preserve_equation_focus_rules() {
+        let mut app = AppState::new();
+        enter_equation(&mut app);
+        let mut active = CompiledExpression::compile("x").expect("valid expression");
+        assert!(matches!(
+            app.handle_editor_event(event::TOOLBOX, &mut active),
+            UpdateResult::Continue
+        ));
+        assert!(app.editor.function_picker_open());
+        assert!(matches!(
+            app.update(key(keyboard::BACK)),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.active_tab, Tab::Equation);
+        assert_eq!(app.focus, Focus::Content);
+        assert!(!app.editor.function_picker_open());
+
+        release(&mut app);
+        let _ = app.handle_editor_event(event::TOOLBOX, &mut active);
+        assert!(app.editor.function_picker_open());
+        assert!(matches!(
+            app.update(key(keyboard::OK)),
+            UpdateResult::StateChanged
+        ));
+        assert_eq!(app.focus, Focus::Tabs);
+        assert!(!app.editor.function_picker_open());
     }
 
     #[test]

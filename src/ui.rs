@@ -38,7 +38,7 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.6.0\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.6.1\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
@@ -292,12 +292,15 @@ pub fn draw_settings(
     domain: Domain,
     focused: bool,
     graph_render_ms: u32,
+    auto_rotate: bool,
 ) {
     clear_content();
     match settings.page() {
         SettingsPage::Main => draw_settings_menu(settings, options, focused),
         SettingsPage::Domain => draw_domain_settings(settings, domain, focused),
-        SettingsPage::Appearance => draw_appearance_settings(settings, options, focused),
+        SettingsPage::Appearance => {
+            draw_appearance_settings(settings, options, focused, auto_rotate)
+        }
         SettingsPage::CustomColor => draw_custom_color_settings(settings, focused),
     }
     eadk::display::draw_string(
@@ -453,11 +456,21 @@ fn setting_value(item: SettingsItem, options: GraphOptions) -> (&'static [u8], u
     }
 }
 
-const APPEARANCE_LABELS: [&[u8]; 3] = [b"Lighting\0", b"Surface color\0", b"Resolution\0"];
+const APPEARANCE_LABELS: [&[u8]; 4] = [
+    b"Lighting\0",
+    b"Surface color\0",
+    b"Resolution\0",
+    b"Auto rotate\0",
+];
 const APPEARANCE_ROW_TOP: u16 = 56;
-const APPEARANCE_ROW_HEIGHT: u16 = 34;
+const APPEARANCE_ROW_HEIGHT: u16 = 29;
 
-fn draw_appearance_settings(settings: &SettingsState, options: GraphOptions, focused: bool) {
+fn draw_appearance_settings(
+    settings: &SettingsState,
+    options: GraphOptions,
+    focused: bool,
+    auto_rotate: bool,
+) {
     eadk::display::draw_string(
         b"Solid appearance\0",
         Point { x: 12, y: 31 },
@@ -498,7 +511,8 @@ fn draw_appearance_settings(settings: &SettingsState, options: GraphOptions, foc
             BLACK,
             background,
         );
-        let (value, x) = appearance_value(AppearanceItem::from_index(row as u8), options);
+        let (value, x) =
+            appearance_value(AppearanceItem::from_index(row as u8), options, auto_rotate);
         eadk::display::draw_string(
             value,
             Point { x, y: top + 7 },
@@ -517,7 +531,11 @@ fn draw_appearance_settings(settings: &SettingsState, options: GraphOptions, foc
     );
 }
 
-fn appearance_value(item: AppearanceItem, options: GraphOptions) -> (&'static [u8], u16) {
+fn appearance_value(
+    item: AppearanceItem,
+    options: GraphOptions,
+    auto_rotate: bool,
+) -> (&'static [u8], u16) {
     match item {
         AppearanceItem::Lighting => match options.lighting {
             LightingPreset::Standard => (b"Standard\0", 242),
@@ -541,6 +559,13 @@ fn appearance_value(item: AppearanceItem, options: GraphOptions) -> (&'static [u
             crate::surface::ResolutionPreset::Standard => (b"Standard 25x19\0", 214),
             crate::surface::ResolutionPreset::High => (b"High 33x25\0", 235),
         },
+        AppearanceItem::AutoRotate => {
+            if auto_rotate {
+                (b"On\0", 284)
+            } else {
+                (b"Off\0", 277)
+            }
+        }
     }
 }
 
@@ -939,7 +964,7 @@ mod tests {
 
     #[test]
     fn displayed_release_version_remains_manually_fixed() {
-        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.6.0\0");
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.6.1\0");
     }
 
     #[test]

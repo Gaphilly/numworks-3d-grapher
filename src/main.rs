@@ -104,6 +104,7 @@ pub extern "C" fn main() {
                     app.domain,
                     app.focus == app::Focus::Content,
                     app.graph_render_profile_ms(),
+                    app.auto_rotate_enabled(),
                 ),
             }
             app.dirty.content = false;
@@ -116,6 +117,8 @@ pub extern "C" fn main() {
             );
             app.dirty.header = false;
         }
+
+        app.advance_auto_rotate(eadk::timing::millis());
 
         // Raw state owns continuous camera motion and application focus changes.
         // Semantic events are polled only where text/tab input needs them, so a

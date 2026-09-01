@@ -31,7 +31,7 @@ pub const SETTINGS_ITEM_COUNT: usize = 8;
 /// Number of editable bounds on the Domain page.
 pub const DOMAIN_FIELD_COUNT: usize = 4;
 /// Number of bounded choices on the Appearance page.
-pub const APPEARANCE_ITEM_COUNT: usize = 3;
+pub const APPEARANCE_ITEM_COUNT: usize = 4;
 /// Three channels plus an explicit transactional Apply row.
 pub const CUSTOM_COLOR_ITEM_COUNT: usize = 4;
 /// Coarse channel adjustment used by Left/Right outside the numeric editor.
@@ -81,6 +81,7 @@ pub enum AppearanceItem {
     Lighting,
     SurfaceColor,
     Resolution,
+    AutoRotate,
 }
 
 impl AppearanceItem {
@@ -89,6 +90,7 @@ impl AppearanceItem {
             AppearanceItem::Lighting => 0,
             AppearanceItem::SurfaceColor => 1,
             AppearanceItem::Resolution => 2,
+            AppearanceItem::AutoRotate => 3,
         }
     }
 
@@ -96,7 +98,8 @@ impl AppearanceItem {
         match index {
             0 => AppearanceItem::Lighting,
             1 => AppearanceItem::SurfaceColor,
-            _ => AppearanceItem::Resolution,
+            2 => AppearanceItem::Resolution,
+            _ => AppearanceItem::AutoRotate,
         }
     }
 }
@@ -215,6 +218,8 @@ pub enum SettingsAction {
     GraphChanged,
     /// Sampling density changed; the current surface must be rebuilt before rendering.
     ResolutionChanged,
+    /// Toggles the transient application camera animation state.
+    AutoRotateChanged,
     /// A fully validated domain should transactionally replace the active one.
     DomainChanged(Domain),
     /// The application should restore its established default camera.
@@ -659,6 +664,7 @@ impl SettingsState {
                 };
                 return SettingsAction::ResolutionChanged;
             }
+            AppearanceItem::AutoRotate => return SettingsAction::AutoRotateChanged,
         }
         SettingsAction::GraphChanged
     }
@@ -1283,6 +1289,12 @@ mod tests {
         assert_eq!(
             options.resolution,
             crate::surface::ResolutionPreset::Standard
+        );
+        assert_eq!(state.select_next(), SettingsAction::Redraw);
+        assert_eq!(state.selected_appearance_item(), AppearanceItem::AutoRotate);
+        assert_eq!(
+            state.adjust_right(&mut options),
+            SettingsAction::AutoRotateChanged
         );
     }
 

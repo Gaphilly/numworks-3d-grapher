@@ -94,11 +94,11 @@ Rendering and visibility changes only invalidate graph composition. Camera reset
 
 ### Appearance page
 
-Appearance provides three bounded Solid-only settings: **Lighting** (`Standard`, `Soft`, or `Strong`), **Surface color** (`Blue`, `Green`, `Orange`, `Purple`, `Gray`, `Red`, `Cyan`, `Yellow`, `White`, or `Custom`), and **Resolution** (`Low`, `Standard`, or `High`). Up/Down selects a row, Left/Right cycles its value, and Back returns to the main Settings page. EXE retains forward cycling for built-in colors and opens the Custom Color page when Custom is selected.
+Appearance provides four bounded Solid-only settings: **Lighting** (`Standard`, `Soft`, or `Strong`), **Surface color** (`Blue`, `Green`, `Orange`, `Purple`, `Gray`, `Red`, `Cyan`, `Yellow`, `White`, or `Custom`), **Resolution** (`Low`, `Standard`, or `High`), and **Auto rotate** (`Off` or `On`). Up/Down selects a row and Left/Right cycles its value. Back returns to the main Settings page. EXE retains forward cycling for built-in colors, opens the Custom Color page when Custom is selected, and toggles Auto rotate.
 
 The Custom Color page edits Red, Green, and Blue channels in `0..=255`. Left/Right adjusts the temporary channel by eight, while EXE opens the existing fixed 24-byte numeric editor for an exact value. Nothing becomes active until EXE on **Apply**; Back cancels a channel draft or the complete Custom Color draft. The page includes an RGB565 preview, uses no heap, and never starts a blocking input loop.
 
-Lighting and color remain independent. Appearance changes invalidate graph composition but do not resample the expression, rebuild triangle normals, alter camera/depth state, or affect Wireframe.
+Lighting and color remain independent. Appearance changes invalidate graph composition but do not resample the expression, rebuild triangle normals, alter camera/depth state, or affect Wireframe. Auto rotate is a transient setting and does not change the sampled surface; it advances horizontal yaw only while Graph content has focus and pauses in tabs, Settings, and editors.
 
 ### Domain page
 
@@ -320,7 +320,12 @@ The final command requires a connected calculator and begins the mandatory physi
 
 ## Version policy
 
-Settings displays the manually maintained version string **`v2.6.0`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+Settings displays the manually maintained version string **`v2.6.1`**. Routine renderer, documentation, build, or packaging changes must not modify it; update it only when an explicit version change is requested. It is independent of automatic timestamps or generated artifacts.
+
+## v2.6.1 changes
+
+- Adds optional horizontal automatic camera rotation from Appearance settings.
+- Auto-rotation is frame-rate independent, pauses outside Graph content focus, and preserves surface sampling and rendering performance.
 
 ## v2.6.0 changes
 

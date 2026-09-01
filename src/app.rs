@@ -96,6 +96,10 @@ pub struct AppState {
     pub focus: Focus,
     pub dirty: DirtyFlags,
     pub editor: EquationEditor,
+    auto_rotate: bool,
+    auto_rotate_armed: bool,
+    auto_rotate_last_ms: u64,
+    manual_camera_changed: bool,
     last_graph_render_ms: u32,
     editor_repeat: EditorKeyRepeat,
     previous_keys: keyboard::State,
@@ -120,11 +124,46 @@ impl AppState {
                 surface: true,
             },
             editor: EquationEditor::new(),
+            auto_rotate: false,
+            auto_rotate_armed: false,
+            auto_rotate_last_ms: 0,
+            manual_camera_changed: false,
             last_graph_render_ms: 0,
             editor_repeat: EditorKeyRepeat::new(),
             previous_keys: 0,
             pressed_keys: 0,
         }
+    }
+
+    /// Whether transient automatic horizontal orbit is enabled.
+    pub fn auto_rotate_enabled(&self) -> bool {
+        self.auto_rotate
+    }
+
+    /// Advances automatic yaw using a bounded, frame-rate-independent interval.
+    pub fn advance_auto_rotate(&mut self, now_ms: u64) {
+        if self.manual_camera_changed {
+            self.manual_camera_changed = false;
+            self.auto_rotate_armed = false;
+        }
+        if !self.auto_rotate || self.active_tab != Tab::Graph || self.focus != Focus::Content {
+            self.auto_rotate_armed = false;
+            return;
+        }
+        if !self.auto_rotate_armed {
+            self.auto_rotate_last_ms = now_ms;
+            self.auto_rotate_armed = true;
+            return;
+        }
+        let delta_ms = now_ms.saturating_sub(self.auto_rotate_last_ms).min(100);
+        self.auto_rotate_last_ms = now_ms;
+        if delta_ms == 0 {
+            return;
+        }
+        self.camera
+            .orbit(core::f32::consts::PI / 6.0 * delta_ms as f32 * 0.001, 0.0);
+        self.dirty.content = true;
+        self.dirty.graph = true;
     }
 
     /// Raw down edges discovered during the most recent `update` call.
@@ -276,6 +315,7 @@ impl AppState {
 
         if self.active_tab == Tab::Graph {
             if let input::Action::Redraw = input::update(&mut self.camera, keys) {
+                self.manual_camera_changed = true;
                 self.dirty.content = true;
                 self.dirty.graph = true;
             }
@@ -344,6 +384,13 @@ impl AppState {
                 self.dirty.surface = true;
                 UpdateResult::Continue
             }
+            SettingsAction::AutoRotateChanged => {
+                self.auto_rotate = !self.auto_rotate;
+                self.auto_rotate_armed = false;
+                self.dirty.content = true;
+                self.dirty.graph = true;
+                UpdateResult::Continue
+            }
             SettingsAction::DomainChanged(domain) => {
                 self.domain = domain;
                 self.dirty.content = true;
@@ -353,6 +400,7 @@ impl AppState {
             }
             SettingsAction::ResetCamera => {
                 self.camera.reset();
+                self.manual_camera_changed = true;
                 self.dirty.content = true;
                 self.dirty.graph = true;
                 UpdateResult::Continue
@@ -530,7 +578,68 @@ mod tests {
 
     #[test]
     fn app_state_storage_remains_bounded() {
-        assert_eq!(core::mem::size_of::<AppState>(), 312);
+        assert_eq!(core::mem::size_of::<AppState>(), 320);
+    }
+
+    #[test]
+    fn auto_rotate_defaults_off_and_toggles_from_appearance() {
+        let mut app = AppState::new();
+        assert!(!app.auto_rotate_enabled());
+        enter_settings(&mut app);
+        let _ = app.update(key(keyboard::EXE));
+        release(&mut app);
+        settings_move_down(&mut app, 3);
+        app.dirty.surface = false;
+        let _ = app.update(key(keyboard::EXE));
+        assert!(app.auto_rotate_enabled());
+        assert!(!app.dirty.surface);
+        release(&mut app);
+        let _ = app.update(key(keyboard::EXE));
+        assert!(!app.auto_rotate_enabled());
+    }
+
+    #[test]
+    fn auto_rotate_is_bounded_focus_aware_and_camera_only() {
+        let mut app = AppState::new();
+        app.auto_rotate = true;
+        app.dirty.content = false;
+        app.dirty.graph = false;
+        app.dirty.surface = false;
+        let original_pitch = app.camera.pitch;
+        let original_distance = app.camera.distance;
+        app.advance_auto_rotate(1_000);
+        let initial_yaw = app.camera.yaw;
+        app.advance_auto_rotate(2_000);
+        let capped_yaw_delta = app.camera.yaw - initial_yaw;
+        assert!((capped_yaw_delta - core::f32::consts::PI / 6.0 * 0.1).abs() < 0.0001);
+        assert_eq!(app.camera.pitch, original_pitch);
+        assert_eq!(app.camera.distance, original_distance);
+        assert!(app.dirty.content);
+        assert!(app.dirty.graph);
+        assert!(!app.dirty.surface);
+
+        app.active_tab = Tab::Equation;
+        let paused_yaw = app.camera.yaw;
+        app.advance_auto_rotate(3_000);
+        app.active_tab = Tab::Graph;
+        app.advance_auto_rotate(10_000);
+        assert_eq!(app.camera.yaw, paused_yaw);
+        app.advance_auto_rotate(10_050);
+        assert!(app.camera.yaw != paused_yaw);
+    }
+
+    #[test]
+    fn manual_camera_motion_rearms_auto_rotate_clock() {
+        let mut app = AppState::new();
+        app.auto_rotate = true;
+        app.advance_auto_rotate(100);
+        app.advance_auto_rotate(150);
+        let _ = app.update(key(keyboard::RIGHT));
+        let yaw_after_manual = app.camera.yaw;
+        app.advance_auto_rotate(10_000);
+        assert_eq!(app.camera.yaw, yaw_after_manual);
+        app.advance_auto_rotate(10_050);
+        assert!(app.camera.yaw != yaw_after_manual);
     }
 
     #[test]

@@ -197,7 +197,8 @@ pub struct GraphOptions {
     pub surface_palette: SurfacePalette,
     /// User-maintained RGB888 base used when `surface_palette` is Custom.
     pub custom_rgb: Rgb888,
-    /// Fixed surface sampling density. Standard is the released 25×19 grid.
+    /// Fixed surface sampling density. Standard is the released 25×19 grid;
+    /// Ultra remains bounded by the persistent 41×31 surface capacity.
     pub resolution: ResolutionPreset,
     /// World-space grid on the XY plane; distinct from the solid surface mesh.
     pub show_grid: bool,

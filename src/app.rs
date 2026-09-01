@@ -734,6 +734,31 @@ mod tests {
     }
 
     #[test]
+    fn ultra_resolution_change_keeps_surface_dirty_and_auto_rotate_camera_only() {
+        let mut app = AppState::new();
+        enter_settings(&mut app);
+        let _ = app.update(key(keyboard::EXE));
+        release(&mut app);
+        settings_move_down(&mut app, 2);
+        let _ = app.update(key(keyboard::RIGHT));
+        release(&mut app);
+        let _ = app.update(key(keyboard::RIGHT));
+        assert_eq!(
+            app.graph_options.resolution,
+            crate::surface::ResolutionPreset::Ultra
+        );
+        assert!(app.dirty.surface);
+
+        app.dirty.surface = false;
+        app.auto_rotate = true;
+        app.show_graph();
+        app.advance_auto_rotate(100);
+        app.advance_auto_rotate(150);
+        assert!(!app.dirty.surface);
+        assert!(app.dirty.graph);
+    }
+
+    #[test]
     fn custom_color_apply_dirties_graph_without_resampling() {
         let mut app = AppState::new();
         enter_settings(&mut app);

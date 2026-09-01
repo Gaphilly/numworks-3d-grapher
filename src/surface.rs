@@ -19,6 +19,9 @@ pub enum ResolutionPreset {
     Low,
     Standard,
     High,
+    /// Maximum fixed-density preset. Capacity is allocated persistently, while
+    /// only its active 41 by 31 rectangle participates in sampling/rendering.
+    Ultra,
 }
 
 impl ResolutionPreset {
@@ -27,6 +30,7 @@ impl ResolutionPreset {
             Self::Low => 17,
             Self::Standard => 25,
             Self::High => 33,
+            Self::Ultra => 41,
         }
     }
 
@@ -35,6 +39,7 @@ impl ResolutionPreset {
             Self::Low => 13,
             Self::Standard => 19,
             Self::High => 25,
+            Self::Ultra => 31,
         }
     }
 
@@ -47,15 +52,17 @@ impl ResolutionPreset {
         match self {
             Self::Low => Self::Standard,
             Self::Standard => Self::High,
-            Self::High => Self::Low,
+            Self::High => Self::Ultra,
+            Self::Ultra => Self::Low,
         }
     }
 
     pub const fn previous(self) -> Self {
         match self {
-            Self::Low => Self::High,
+            Self::Low => Self::Ultra,
             Self::Standard => Self::Low,
             Self::High => Self::Standard,
+            Self::Ultra => Self::High,
         }
     }
 }
@@ -67,9 +74,9 @@ pub const COLUMNS: usize = ResolutionPreset::Standard.columns();
 #[cfg(test)]
 pub const ROWS: usize = ResolutionPreset::Standard.rows();
 /// Maximum fixed storage dimensions; no user input can change them.
-pub const MAX_COLUMNS: usize = ResolutionPreset::High.columns();
+pub const MAX_COLUMNS: usize = ResolutionPreset::Ultra.columns();
 /// Maximum fixed storage dimensions; no user input can change them.
-pub const MAX_ROWS: usize = ResolutionPreset::High.rows();
+pub const MAX_ROWS: usize = ResolutionPreset::Ultra.rows();
 /// Two consistently wound triangles cover every regular-grid cell.
 pub const TRIANGLES_PER_CELL: usize = 2;
 /// Transient one-byte light/validity values for every regular-grid triangle.
@@ -187,8 +194,8 @@ pub struct Point3 {
 
 /// Fixed-capacity height cache for the current compiled expression and domain.
 ///
-/// Capacity is sized once for the High 33×25 preset: 3,300 bytes of heights,
-/// 232 bytes of cached X/Y coordinates, and 1,536 bytes of triangle light
+/// Capacity is sized once for the Ultra 41×31 preset: 5,084 bytes of heights,
+/// 288 bytes of cached X/Y coordinates, and 2,400 bytes of triangle light
 /// levels. Only the active preset rectangle is sampled or traversed. NaN and
 /// infinite evaluations remain in the active height cache and later invalidate
 /// every touching Solid triangle, so ordinary invalid mathematical input cannot
@@ -736,8 +743,16 @@ mod tests {
             (33, 25)
         );
         assert_eq!(ResolutionPreset::High.triangle_count(), 1_536);
-        assert!(ResolutionPreset::High.columns() <= MAX_COLUMNS);
-        assert!(ResolutionPreset::High.rows() <= MAX_ROWS);
+        assert_eq!(
+            (
+                ResolutionPreset::Ultra.columns(),
+                ResolutionPreset::Ultra.rows()
+            ),
+            (41, 31)
+        );
+        assert_eq!(ResolutionPreset::Ultra.triangle_count(), 2_400);
+        assert!(ResolutionPreset::Ultra.columns() <= MAX_COLUMNS);
+        assert!(ResolutionPreset::Ultra.rows() <= MAX_ROWS);
     }
 
     #[test]
@@ -747,6 +762,7 @@ mod tests {
             ResolutionPreset::Low,
             ResolutionPreset::Standard,
             ResolutionPreset::High,
+            ResolutionPreset::Ultra,
         ] {
             let grid = SurfaceGrid::sample_with_resolution(domain, &Plane, resolution);
             assert_eq!(grid.solid_point(0, 0).x, domain.x_min);
@@ -794,6 +810,7 @@ mod tests {
             ResolutionPreset::Low,
             ResolutionPreset::Standard,
             ResolutionPreset::High,
+            ResolutionPreset::Ultra,
         ] {
             let grid =
                 SurfaceGrid::sample_with_resolution(Domain::DEFAULT, &expression, resolution);
@@ -862,10 +879,10 @@ mod tests {
         let shades = triangle_shades(&grid, Domain::DEFAULT);
         assert_ne!(shades[0][0][0], 0);
         assert_ne!(shades[ROWS - 2][COLUMNS - 2][1], 0);
-        assert_eq!(core::mem::size_of::<TriangleShades>(), 1_536);
-        // 1,900 height bytes plus 864 cached shades and 176 cached X/Y bytes,
+        assert_eq!(core::mem::size_of::<TriangleShades>(), 2_400);
+        // 5,084 height bytes plus 2,400 cached shades and 288 cached X/Y bytes,
         // with the range metadata/alignment required by the target ABI.
-        assert_eq!(core::mem::size_of::<SurfaceGrid>(), 5_080);
+        assert_eq!(core::mem::size_of::<SurfaceGrid>(), 7_784);
     }
 
     #[test]

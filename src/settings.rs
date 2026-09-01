@@ -1290,6 +1290,21 @@ mod tests {
             options.resolution,
             crate::surface::ResolutionPreset::Standard
         );
+        assert_eq!(
+            state.adjust_right(&mut options),
+            SettingsAction::ResolutionChanged
+        );
+        assert_eq!(options.resolution, crate::surface::ResolutionPreset::High);
+        assert_eq!(
+            state.adjust_right(&mut options),
+            SettingsAction::ResolutionChanged
+        );
+        assert_eq!(options.resolution, crate::surface::ResolutionPreset::Ultra);
+        assert_eq!(
+            state.adjust_right(&mut options),
+            SettingsAction::ResolutionChanged
+        );
+        assert_eq!(options.resolution, crate::surface::ResolutionPreset::Low);
         assert_eq!(state.select_next(), SettingsAction::Redraw);
         assert_eq!(state.selected_appearance_item(), AppearanceItem::AutoRotate);
         assert_eq!(

@@ -5,7 +5,7 @@
 //! display transfers without a 153,600-byte full-screen framebuffer or depth
 //! buffer. Solid modes add only a same-sized 16-bit depth band; they never
 //! allocate a full-screen color or depth buffer. The selected fixed 17×13,
-//! 25×19, or 33×25 height field is traversed directly as active regular-grid
+//! 25×19, 33×25, or 41×31 height field is traversed directly as active regular-grid
 //! triangles rather than expanded into a mesh.
 //!
 //! Composition order is deliberately repeated inside every band: clear, grid,
@@ -45,7 +45,7 @@ const DEPTH_KEY_MAX: f32 = u16::MAX as f32;
 #[cfg(test)]
 const SURFACE_GRID_DEPTH_TOLERANCE: u16 = 24;
 #[cfg(test)]
-const SURFACE_GRID_EDGE_COUNT: usize = 19 * (25 - 1) + 25 * (19 - 1);
+const STANDARD_SURFACE_GRID_EDGE_COUNT: usize = 19 * (25 - 1) + 25 * (19 - 1);
 
 const NUMERIC_GLYPHS: [[u8; 7]; 13] = [
     [
@@ -2455,8 +2455,8 @@ mod tests {
             core::mem::size_of::<[u16; SCREEN_WIDTH * BAND_HEIGHT]>(),
             5_120
         );
-        assert_eq!(core::mem::size_of::<TriangleShades>(), 1_536);
-        assert_eq!(core::mem::size_of::<ProjectionScratch>(), 4_950,);
+        assert_eq!(core::mem::size_of::<TriangleShades>(), 2_400);
+        assert_eq!(core::mem::size_of::<ProjectionScratch>(), 7_626,);
         assert_eq!(encode_inverse_depth(1.0), 0);
         let near = encode_inverse_depth(SOLID_NEAR_DEPTH);
         let middle = encode_inverse_depth(8.0);
@@ -2699,7 +2699,7 @@ mod tests {
 
     #[test]
     fn solid_grid_topology_visits_each_unique_edge_once() {
-        assert_eq!(SURFACE_GRID_EDGE_COUNT, 906);
+        assert_eq!(STANDARD_SURFACE_GRID_EDGE_COUNT, 906);
         assert_eq!(ROWS * (COLUMNS - 1), 456);
         assert_eq!(COLUMNS * (ROWS - 1), 450);
     }

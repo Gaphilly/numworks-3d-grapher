@@ -38,7 +38,7 @@ const TAB_TEXT_X: [u16; 3] = [31, 126, 235];
 // This user-facing version is intentionally maintained by hand. Do not derive,
 // synchronize, or update it from Cargo metadata, Git tags, or release tooling;
 // change it only when the project owner explicitly requests a displayed update.
-const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.6.1\0";
+const APPLICATION_DISPLAY_VERSION: &[u8] = b"v2.7.0\0";
 const SMALL_FONT_CHARACTER_WIDTH: u16 = 7;
 const VERSION_TEXT_WIDTH: u16 =
     (APPLICATION_DISPLAY_VERSION.len() as u16 - 1) * SMALL_FONT_CHARACTER_WIDTH;
@@ -558,6 +558,7 @@ fn appearance_value(
             crate::surface::ResolutionPreset::Low => (b"Low 17x13\0", 242),
             crate::surface::ResolutionPreset::Standard => (b"Standard 25x19\0", 214),
             crate::surface::ResolutionPreset::High => (b"High 33x25\0", 235),
+            crate::surface::ResolutionPreset::Ultra => (b"Ultra 41x31\0", 228),
         },
         AppearanceItem::AutoRotate => {
             if auto_rotate {
@@ -964,7 +965,7 @@ mod tests {
 
     #[test]
     fn displayed_release_version_remains_manually_fixed() {
-        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.6.1\0");
+        assert_eq!(APPLICATION_DISPLAY_VERSION, b"v2.7.0\0");
     }
 
     #[test]
